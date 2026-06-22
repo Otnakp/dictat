@@ -2,35 +2,35 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleName</key>
-    <string>Dictat</string>
-    <key>CFBundleDisplayName</key>
-    <string>Dictat</string>
-    <key>CFBundleIdentifier</key>
-    <string>com.otnakp.dictat</string>
-    <key>CFBundleVersion</key>
-    <string>1</string>
-    <key>CFBundleShortVersionString</key>
-    <string>1.0.0</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-    <key>CFBundleExecutable</key>
-    <string>Dictat</string>
-    <key>CFBundleInfoDictionaryVersion</key>
-    <string>6.0</string>
-    <key>LSMinimumSystemVersion</key>
-    <string>14.0</string>
-    <key>LSUIElement</key>
-    <true/>
-    <key>NSMicrophoneUsageDescription</key>
-    <string>Dictat usa il microfono per trascrivere la tua voce in testo locale.</string>
-    <key>NSSpeechRecognitionUsageDescription</key>
-    <string>Dictat usa il riconoscimento vocale Apple (preferendo on-device).</string>
-    <key>SUEnableAutomaticChecks</key>
-    <true/>
-    <key>SUFeedURL</key>
-    <string>https://github.com/Otnakp/dictat/releases/latest/download/appcast.xml</string>
-    <key>SUPublicEDKey</key>
-    <string>C3e4wPfJpmcGZ3mIRicxuzJ6zEDsKmmWU6qrp4jroAg=</string>
+	<key>CFBundleDisplayName</key>
+	<string>Dictat</string>
+	<key>CFBundleExecutable</key>
+	<string>Dictat</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.otnakp.dictat</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Dictat</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0.0</string>
+	<key>CFBundleVersion</key>
+	<string>202606221727</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Dictat usa il microfono per trascrivere la tua voce in testo locale.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Dictat usa il riconoscimento vocale Apple (preferendo on-device).</string>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUFeedURL</key>
+	<string>https://github.com/Otnakp/dictat/releases/latest/download/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>C3e4wPfJpmcGZ3mIRicxuzJ6zEDsKmmWU6qrp4jroAg=</string>
 </dict>
 </plist>

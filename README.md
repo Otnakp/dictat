@@ -22,7 +22,15 @@ Lives only in the menu bar. All code in one file:
 ### Homebrew (recommended)
 
 ```bash
-brew tap Otnakp/dictat            # adds the Otnakp/homebrew-dictat tap
+brew tap otnakp/dictat            # adds the otnakp/homebrew-dictat tap
+brew install --cask dictat
+```
+
+Homebrew asks you to trust third-party taps once (their casks run Ruby). If you see
+*"Refusing to load cask … from untrusted tap"*, run:
+
+```bash
+brew trust otnakp/dictat
 brew install --cask dictat
 ```
 
