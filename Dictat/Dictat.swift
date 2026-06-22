@@ -387,6 +387,10 @@ final class HotkeyManager {
 
 // MARK: - Speech
 
+/// Dettatura lunga: SFSpeechRecognizer segmenta sui silenzi e ha un limite (~1 min) per
+/// sessione, e `bestTranscription` riflette solo il segmento corrente. Per non perdere il
+/// testo precedente accumuliamo ogni segmento finalizzato e riavviamo una nuova sessione,
+/// continuando finché l'utente non rilascia.
 final class SpeechTranscriber {
     var onFinal: ((String) -> Void)?
     var onError: ((String) -> Void)?
@@ -395,8 +399,11 @@ final class SpeechTranscriber {
     private var task: SFSpeechRecognitionTask?
     private var req: SFSpeechAudioBufferRecognitionRequest?
     private let lock = NSLock()
-    private var best = ""
+    private var accumulated = ""    // segmenti già finalizzati
+    private var current = ""        // partial del segmento corrente
     private var done = false
+    private var stopping = false    // l'utente ha rilasciato → finalizza
+    private var fallback: DispatchWorkItem?
     private let onDeviceOnly: Bool
     private let punct: Bool
 
@@ -410,54 +417,84 @@ final class SpeechTranscriber {
         guard let r = recognizer, r.isAvailable else {
             throw err(L("Riconoscimento non disponibile per questa lingua", "Recognition unavailable for this language"))
         }
+        if onDeviceOnly && !r.supportsOnDeviceRecognition {
+            throw err(L("On-device non disponibile. Disattiva \"Solo on-device\".", "On-device unavailable. Turn off \"On-device only\"."))
+        }
+        startSegment()
+    }
+
+    private func startSegment() {
+        guard let r = recognizer else { return }
         let q = SFSpeechAudioBufferRecognitionRequest()
         q.shouldReportPartialResults = true
         if #available(macOS 13, *) { q.addsPunctuation = punct }
-        if onDeviceOnly {
-            guard r.supportsOnDeviceRecognition else {
-                throw err(L("On-device non disponibile. Disattiva \"Solo on-device\".", "On-device unavailable. Turn off \"On-device only\"."))
-            }
-            q.requiresOnDeviceRecognition = true
-        } else {
-            q.requiresOnDeviceRecognition = r.supportsOnDeviceRecognition
-        }
+        q.requiresOnDeviceRecognition = onDeviceOnly ? true : r.supportsOnDeviceRecognition
         req = q
         task = r.recognitionTask(with: q) { [weak self] res, e in
             guard let self else { return }
             if let res = res {
-                self.lock.lock(); self.best = res.bestTranscription.formattedString; self.lock.unlock()
-                if res.isFinal { DispatchQueue.main.async { self.complete() } }
+                self.lock.lock(); self.current = res.bestTranscription.formattedString; self.lock.unlock()
+                if res.isFinal { DispatchQueue.main.async { self.segmentEnded() } }
             }
-            if let e = e {
-                DispatchQueue.main.async {
-                    self.lock.lock(); let empty = self.best.isEmpty; self.lock.unlock()
-                    empty ? self.fail(e.localizedDescription) : self.complete()
-                }
-            }
+            if let e = e { DispatchQueue.main.async { self.segmentError(e) } }
         }
     }
 
     func append(_ b: AVAudioPCMBuffer) { req?.append(b) }
 
     func stopAndFinalize() {
+        stopping = true
         req?.endAudio()
-        // Fallback: se il riconoscitore non emette mai isFinal, chiudiamo dopo 2s.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.complete() }
+        // Fallback: se non arriva isFinal entro 2.5s, chiudi con quel che c'è.
+        let w = DispatchWorkItem { [weak self] in self?.commitCurrent(); self?.complete() }
+        fallback = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: w)
     }
 
-    func cancel() { done = true; task?.cancel(); task = nil; req = nil }
+    func cancel() { done = true; fallback?.cancel(); task?.cancel(); task = nil; req = nil }
 
-    // complete()/fail() girano sempre su main → done fa da guardia, niente race.
+    // --- tutto da qui gira su main ---
+
+    private func commitCurrent() {
+        lock.lock()
+        if !current.isEmpty {
+            accumulated = accumulated.isEmpty ? current : accumulated + " " + current
+            current = ""
+        }
+        lock.unlock()
+    }
+
+    private func segmentEnded() {
+        commitCurrent()
+        task?.finish(); task = nil; req = nil
+        if stopping { complete() } else { startSegment() }   // continua il dettato
+    }
+
+    private func segmentError(_ e: Error) {
+        commitCurrent()
+        task?.cancel(); task = nil; req = nil
+        if stopping { complete(); return }
+        lock.lock(); let empty = accumulated.isEmpty; lock.unlock()
+        if empty { fail(e.localizedDescription) }            // nessun testo → errore vero
+        else { startSegment() }                              // limite di sessione → riparti
+    }
+
+    private func text() -> String {
+        lock.lock()
+        let joined = current.isEmpty ? accumulated : (accumulated.isEmpty ? current : accumulated + " " + current)
+        lock.unlock()
+        return joined.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private func complete() {
         guard !done else { return }
-        done = true
+        done = true; fallback?.cancel()
         task?.finish(); task = nil; req = nil
-        lock.lock(); let text = best; lock.unlock()
-        onFinal?(text.trimmingCharacters(in: .whitespacesAndNewlines))
+        onFinal?(text())
     }
     private func fail(_ m: String) {
         guard !done else { return }
-        done = true; task?.cancel(); task = nil; req = nil
+        done = true; fallback?.cancel(); task?.cancel(); task = nil; req = nil
         onError?(m)
     }
     private func err(_ m: String) -> NSError { NSError(domain: "Dictat", code: 1,
