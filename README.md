@@ -1,8 +1,10 @@
+# Dictat
+
 <p align="center">
   <img src="assets/logo.png" alt="Dictat" width="420">
 </p>
 
-# Dictat
+It's time to delete all your paid subscriptions.
 
 Native macOS **push-to-talk dictation** in the menu bar. Like Wispr Flow, but **free, local, open source**.
 Hold a key, speak, release: the transcription (Apple Speech, on-device) is pasted into whatever text
