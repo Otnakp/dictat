@@ -41,6 +41,7 @@ final class StatusBarController: NSObject {
     private let updater = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
     private var recorderWindow: NSWindow?
     private var recorderMonitor: Any?
+    private var recorderMouseMonitor: Any?
 
     init(coord: Coordinator) {
         self.coord = coord
@@ -103,10 +104,16 @@ final class StatusBarController: NSObject {
             if let b = keyBinding(from: ev) { self.finishRecording(b); return nil }
             return ev
         }
+        // I pulsanti del mouse vanno alla finestra sotto il cursore: serve un monitor
+        // globale per catturarli ovunque (per il mouse non richiede permessi speciali).
+        recorderMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.otherMouseDown]) { [weak self] ev in
+            if let b = keyBinding(from: ev) { self?.finishRecording(b) }
+        }
     }
 
     private func finishRecording(_ binding: KeyBinding?) {
         if let m = recorderMonitor { NSEvent.removeMonitor(m); recorderMonitor = nil }
+        if let m = recorderMouseMonitor { NSEvent.removeMonitor(m); recorderMouseMonitor = nil }
         if let binding { coord.state.addBinding(binding) }
         recorderWindow?.close(); recorderWindow = nil
     }
@@ -670,6 +677,7 @@ struct MenuView: View {
                 }
             }
 
+            Divider()
             HStack {
                 Text(t("Lingua", "Language"))
                 Picker("", selection: $state.language) {
