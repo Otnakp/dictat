@@ -28,8 +28,7 @@ brew tap otnakp/dictat            # adds the otnakp/homebrew-dictat tap
 brew install --cask dictat
 ```
 
-Homebrew asks you to trust third-party taps once (their casks run Ruby). If you see
-*"Refusing to load cask … from untrusted tap"*, run:
+Once you install, notice the small microphone icon on the top bar. That's Dictat.
 
 ```bash
 brew trust otnakp/dictat
