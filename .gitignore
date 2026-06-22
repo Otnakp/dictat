@@ -1,0 +1,17 @@
+# Build output
+build/
+DerivedData/
+*.xcarchive
+
+# Xcode / SwiftPM
+xcuserdata/
+*.xcuserstate
+.swiftpm/
+Package.resolved
+
+# Release artifacts
+dist/
+*.zip
+
+# macOS
+.DS_Store
