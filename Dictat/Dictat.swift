@@ -39,6 +39,8 @@ final class StatusBarController: NSObject {
     private var bag = Set<AnyCancellable>()
     // Sparkle: avvia il check automatico degli aggiornamenti (config in Info.plist).
     private let updater = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+    private var recorderWindow: NSWindow?
+    private var recorderMonitor: Any?
 
     init(coord: Coordinator) {
         self.coord = coord
@@ -53,7 +55,8 @@ final class StatusBarController: NSObject {
         popover.contentSize = NSSize(width: 320, height: 480)
         popover.contentViewController = NSHostingController(
             rootView: MenuView(coord: coord, state: coord.state, perm: coord.perm,
-                               onCheckUpdates: { [weak self] in self?.updater.checkForUpdates(nil) }))
+                               onCheckUpdates: { [weak self] in self?.updater.checkForUpdates(nil) },
+                               onRecordKey: { [weak self] in self?.recordKey() }))
 
         // Il glifo dell'icona segue lo stato (idle/recording/transcribing/error).
         coord.state.$status
@@ -79,9 +82,42 @@ final class StatusBarController: NSObject {
             popover.show(relativeTo: b.bounds, of: b, preferredEdge: .minY)
         }
     }
+
+    // Apre una finestrella che cattura il prossimo tasto/modificatore e lo salva come binding.
+    func recordKey() {
+        guard recorderWindow == nil else { return }
+        popover.performClose(nil)
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 150),
+                         styleMask: [.titled], backing: .buffered, defer: false)
+        w.title = L("Registra tasto", "Record key")
+        w.contentViewController = NSHostingController(rootView: KeyRecorderView())
+        w.center(); w.level = .floating; w.isReleasedWhenClosed = false
+        recorderWindow = w
+        NSApp.activate(ignoringOtherApps: true)
+        w.makeKeyAndOrderFront(nil)
+
+        recorderMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] ev in
+            guard let self else { return ev }
+            if ev.type == .keyDown && ev.keyCode == 53 { self.finishRecording(nil); return nil } // Esc
+            if let b = keyBinding(from: ev) { self.finishRecording(b); return nil }
+            return ev
+        }
+    }
+
+    private func finishRecording(_ binding: KeyBinding?) {
+        if let m = recorderMonitor { NSEvent.removeMonitor(m); recorderMonitor = nil }
+        if let binding { coord.state.binding = binding }
+        recorderWindow?.close(); recorderWindow = nil
+    }
 }
 
 // MARK: - State
+
+/// Stringa localizzata in base alla lingua scelta (legge dai defaults → vale ovunque,
+/// anche fuori dalle View). Default inglese.
+func L(_ it: String, _ en: String) -> String {
+    (UserDefaults.standard.string(forKey: "language") ?? "en-US").hasPrefix("it") ? it : en
+}
 
 enum Status: Equatable {
     case idle, recording, transcribing, error(String)
@@ -95,29 +131,67 @@ enum Status: Equatable {
     }
     var label: String {
         switch self {
-        case .idle:            return "Idle"
-        case .recording:       return "Recording…"
-        case .transcribing:    return "Transcribing…"
-        case .error(let m):    return "Errore: \(m)"
+        case .idle:            return L("Inattivo", "Idle")
+        case .recording:       return L("Registrazione…", "Recording…")
+        case .transcribing:    return L("Trascrizione…", "Transcribing…")
+        case .error(let m):    return L("Errore: \(m)", "Error: \(m)")
         }
     }
 }
 
-enum HotKey: String, CaseIterable, Identifiable {
-    case rightOption, fn, ctrlOption
+enum ActivationMode: String, CaseIterable, Identifiable {
+    case hold, toggle, both
     var id: String { rawValue }
-    var label: String {
-        switch self {
-        case .rightOption: return "Right Option ⌥ (consigliato)"
-        case .fn:          return "Fn / Globe"
-        case .ctrlOption:  return "Ctrl + Option ⌃⌥"
+}
+
+/// Tasto push-to-talk configurabile: qualsiasi modificatore o tasto normale.
+struct KeyBinding: Codable, Equatable {
+    var keyCode: Int
+    var isModifier: Bool
+    var modifierFlags: UInt64   // CGEventFlags raw: per i modificatori è il flag del tasto stesso;
+                                // per i tasti normali sono i modificatori richiesti (es. ⌃).
+    var label: String
+
+    static let rightOption = KeyBinding(keyCode: 61, isModifier: true,
+        modifierFlags: CGEventFlags.maskAlternate.rawValue, label: "Right Option ⌥")
+}
+
+/// keycode → flag modificatore (nil = tasto normale).
+func modifierFlag(forKeyCode kc: Int) -> CGEventFlags? {
+    switch kc {
+    case 54, 55: return .maskCommand
+    case 56, 60: return .maskShift
+    case 58, 61: return .maskAlternate
+    case 59, 62: return .maskControl
+    case 63:     return .maskSecondaryFn
+    default:     return nil
+    }
+}
+
+func keyName(keyCode kc: Int, isModifier: Bool) -> String {
+    if isModifier {
+        switch kc {
+        case 55: return "Left Command ⌘";  case 54: return "Right Command ⌘"
+        case 56: return "Left Shift ⇧";     case 60: return "Right Shift ⇧"
+        case 58: return "Left Option ⌥";    case 61: return "Right Option ⌥"
+        case 59: return "Left Control ⌃";   case 62: return "Right Control ⌃"
+        case 63: return "Fn / Globe"
+        default: return "Modifier \(kc)"
         }
     }
+    let names: [Int: String] = [
+        49: "Space", 36: "Return", 48: "Tab", 53: "Esc", 51: "Delete",
+        122:"F1",120:"F2",99:"F3",118:"F4",96:"F5",97:"F6",98:"F7",100:"F8",
+        101:"F9",109:"F10",103:"F11",111:"F12",105:"F13",107:"F14",113:"F15",
+        106:"F16",64:"F17",79:"F18",80:"F19",90:"F20"
+    ]
+    return names[kc] ?? "Key \(kc)"
 }
 
 private enum K {
-    static let enabled = "enabled", hotkey = "hotkey", lang = "language"
+    static let enabled = "enabled", lang = "language"
     static let onDevice = "onDeviceOnly", punct = "autoPunctuation"
+    static let mode = "activationMode", binding = "keyBinding"
 }
 
 final class AppState: ObservableObject {
@@ -126,15 +200,19 @@ final class AppState: ObservableObject {
     @Published var isRecording = false
     @Published var lastTranscript = ""
     @Published var enabled: Bool         { didSet { d.set(enabled, forKey: K.enabled) } }
-    @Published var hotkey: HotKey        { didSet { d.set(hotkey.rawValue, forKey: K.hotkey) } }
+    @Published var mode: ActivationMode  { didSet { d.set(mode.rawValue, forKey: K.mode) } }
+    @Published var binding: KeyBinding   { didSet { if let v = try? JSONEncoder().encode(binding) { d.set(v, forKey: K.binding) } } }
     @Published var language: String      { didSet { d.set(language, forKey: K.lang) } }
     @Published var onDeviceOnly: Bool    { didSet { d.set(onDeviceOnly, forKey: K.onDevice) } }
     @Published var autoPunctuation: Bool { didSet { d.set(autoPunctuation, forKey: K.punct) } }
 
     init() {
         enabled = d.object(forKey: K.enabled) as? Bool ?? true
-        hotkey = HotKey(rawValue: d.string(forKey: K.hotkey) ?? "") ?? .rightOption
-        language = d.string(forKey: K.lang) ?? "it-IT"
+        mode = ActivationMode(rawValue: d.string(forKey: K.mode) ?? "") ?? .hold
+        if let v = d.data(forKey: K.binding), let b = try? JSONDecoder().decode(KeyBinding.self, from: v) {
+            binding = b
+        } else { binding = .rightOption }
+        language = d.string(forKey: K.lang) ?? "en-US"
         onDeviceOnly = d.object(forKey: K.onDevice) as? Bool ?? true
         autoPunctuation = d.object(forKey: K.punct) as? Bool ?? true
     }
@@ -195,15 +273,16 @@ final class PermissionsManager: ObservableObject {
 private func hotkeyCallback(proxy: CGEventTapProxy, type: CGEventType,
                             event: CGEvent, refcon: UnsafeMutableRawPointer?) -> Unmanaged<CGEvent>? {
     if let refcon = refcon {
-        Unmanaged<HotkeyManager>.fromOpaque(refcon).takeUnretainedValue().handle(type, event)
+        let consumed = Unmanaged<HotkeyManager>.fromOpaque(refcon).takeUnretainedValue().handle(type, event)
+        if consumed { return nil } // tasto normale usato come hotkey: non farlo digitare
     }
-    return Unmanaged.passUnretained(event) // listenOnly: non consumiamo l'evento
+    return Unmanaged.passUnretained(event)
 }
 
 final class HotkeyManager {
     var onPress: (() -> Void)?
     var onRelease: (() -> Void)?
-    var keyProvider: (() -> HotKey)?
+    var bindingProvider: (() -> KeyBinding)?
     var enabledProvider: (() -> Bool)?
 
     private var tap: CFMachPort?
@@ -211,13 +290,15 @@ final class HotkeyManager {
     private var down = false
     var isRunning: Bool { tap != nil }
 
-    /// Richiede Accessibilità/Input Monitoring; ritorna nil finché non concesso.
+    /// Richiede Input Monitoring; ritorna nil finché non concesso.
     func start() {
         guard tap == nil else { return }
-        let mask = CGEventMask(1 << CGEventType.flagsChanged.rawValue)
+        let mask = CGEventMask((1 << CGEventType.flagsChanged.rawValue)
+                             | (1 << CGEventType.keyDown.rawValue)
+                             | (1 << CGEventType.keyUp.rawValue))
         let refcon = Unmanaged.passUnretained(self).toOpaque()
         guard let t = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
-                                        options: .listenOnly, eventsOfInterest: mask,
+                                        options: .defaultTap, eventsOfInterest: mask,
                                         callback: hotkeyCallback, userInfo: refcon) else { return }
         tap = t
         src = CFMachPortCreateRunLoopSource(nil, t, 0)
@@ -235,31 +316,47 @@ final class HotkeyManager {
     /// (ri)acquisisce gli eventi globali invece di vederli solo con app in focus.
     func restart() { stop(); start() }
 
-    func handle(_ type: CGEventType, _ event: CGEvent) {
-        // Il sistema disabilita il tap dopo timeout/idle: lo riattiviamo.
+    private let modMask: CGEventFlags = [.maskCommand, .maskControl, .maskAlternate, .maskShift]
+
+    /// Ritorna true se l'evento va consumato (non propagato all'app in focus).
+    func handle(_ type: CGEventType, _ event: CGEvent) -> Bool {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             if let t = tap { CGEvent.tapEnable(tap: t, enable: true) }
-            return
+            return false
         }
-        guard type == .flagsChanged else { return }
         guard enabledProvider?() ?? true else {
             if down { down = false; onRelease?() }
-            return
+            return false
         }
+        let b = bindingProvider?() ?? .rightOption
+        let kc = Int(event.getIntegerValueField(.keyboardEventKeycode))
         let flags = event.flags
-        let kc = event.getIntegerValueField(.keyboardEventKeycode)
-        let active: Bool
-        switch keyProvider?() ?? .rightOption {
-        case .rightOption:
-            // 61 = kVK_RightOption. Aggiorna solo sugli eventi del tasto giusto,
-            // così non confondiamo con Left Option (58) o altri modificatori.
-            active = (kc == 61) ? flags.contains(.maskAlternate) : down
-        case .fn:
-            active = flags.contains(.maskSecondaryFn)
-        case .ctrlOption:
-            active = flags.contains(.maskControl) && flags.contains(.maskAlternate)
+
+        if b.isModifier {
+            guard type == .flagsChanged else { return false }
+            let flag = CGEventFlags(rawValue: b.modifierFlags)
+            let active: Bool
+            if flag.contains(.maskSecondaryFn) {
+                active = flags.contains(.maskSecondaryFn)            // fn: solo il flag
+            } else {
+                active = (kc == b.keyCode) ? flags.contains(flag) : down  // gate sul keycode (L/R)
+            }
+            if active != down { down = active; active ? onPress?() : onRelease?() }
+            return false // i modificatori non digitano: non li consumiamo
         }
-        if active != down { down = active; active ? onPress?() : onRelease?() }
+
+        // Tasto normale: keyDown/keyUp, con i modificatori richiesti.
+        guard kc == b.keyCode else { return false }
+        let need = CGEventFlags(rawValue: b.modifierFlags).intersection(modMask)
+        if type == .keyDown {
+            guard flags.intersection(modMask).isSuperset(of: need) else { return false }
+            if !down { down = true; onPress?() }
+            return true
+        } else if type == .keyUp {
+            if down { down = false; onRelease?() }
+            return true
+        }
+        return false
     }
 }
 
@@ -286,14 +383,14 @@ final class SpeechTranscriber {
 
     func start() throws {
         guard let r = recognizer, r.isAvailable else {
-            throw err("Riconoscimento non disponibile per questa lingua")
+            throw err(L("Riconoscimento non disponibile per questa lingua", "Recognition unavailable for this language"))
         }
         let q = SFSpeechAudioBufferRecognitionRequest()
         q.shouldReportPartialResults = true
         if #available(macOS 13, *) { q.addsPunctuation = punct }
         if onDeviceOnly {
             guard r.supportsOnDeviceRecognition else {
-                throw err("On-device non disponibile. Disattiva \"Solo on-device\".")
+                throw err(L("On-device non disponibile. Disattiva \"Solo on-device\".", "On-device unavailable. Turn off \"On-device only\"."))
             }
             q.requiresOnDeviceRecognition = true
         } else {
@@ -374,14 +471,52 @@ final class Coordinator: ObservableObject {
     private var recording = false
     private var timer: Timer?
     private var lastInputMonitoring = false
+    // Stato per la modalità "both" (tap = toggle, hold = push-to-talk).
+    private var pressStart: Date?
+    private var armed = false
+    private var ignoreRelease = false
+    private let tapThreshold: TimeInterval = 0.35
 
     init() {
-        hotkeys.onPress = { [weak self] in self?.startRecording() }
-        hotkeys.onRelease = { [weak self] in self?.stopRecording() }
-        hotkeys.keyProvider = { [weak self] in self?.state.hotkey ?? .rightOption }
+        hotkeys.onPress = { [weak self] in self?.handlePress() }
+        hotkeys.onRelease = { [weak self] in self?.handleRelease() }
+        hotkeys.bindingProvider = { [weak self] in self?.state.binding ?? .rightOption }
         hotkeys.enabledProvider = { [weak self] in self?.state.enabled ?? false }
         tick()
         timer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in self?.tick() }
+    }
+
+    private func handlePress() {
+        switch state.mode {
+        case .hold:
+            startRecording()
+        case .toggle:
+            recording ? stopRecording() : startRecording()
+        case .both:
+            if armed {                       // secondo tocco → ferma
+                ignoreRelease = true; armed = false; stopRecording()
+            } else if !recording {
+                pressStart = Date(); startRecording()
+            }
+        }
+    }
+
+    private func handleRelease() {
+        switch state.mode {
+        case .hold:
+            stopRecording()
+        case .toggle:
+            break                            // toggle agisce solo sulla pressione
+        case .both:
+            if ignoreRelease { ignoreRelease = false; return }
+            guard recording, let s = pressStart else { return }
+            pressStart = nil
+            if Date().timeIntervalSince(s) >= tapThreshold {
+                stopRecording()              // è stato un hold
+            } else {
+                armed = true                 // è stato un tap → resta in registrazione
+            }
+        }
     }
 
     private func tick() {
@@ -400,8 +535,8 @@ final class Coordinator: ObservableObject {
     func startRecording() {
         guard state.enabled, !recording else { return }
         perm.refresh()
-        guard perm.mic else { state.status = .error("Microfono non autorizzato"); perm.requestMic(); return }
-        guard perm.speech else { state.status = .error("Speech non autorizzato"); perm.requestSpeech(); return }
+        guard perm.mic else { state.status = .error(L("Microfono non autorizzato", "Microphone not authorized")); perm.requestMic(); return }
+        guard perm.speech else { state.status = .error(L("Speech non autorizzato", "Speech not authorized")); perm.requestSpeech(); return }
 
         let t = SpeechTranscriber(locale: Locale(identifier: state.language),
                                   onDeviceOnly: state.onDeviceOnly, punct: state.autoPunctuation)
@@ -447,7 +582,7 @@ final class Coordinator: ObservableObject {
             guard !clean.isEmpty else { return }
             self.state.lastTranscript = clean
             if self.perm.accessibility { self.paster.paste(clean) }
-            else { self.paster.copy(clean); self.state.status = .error("Abilita Accessibilità per incollare") }
+            else { self.paster.copy(clean); self.state.status = .error(L("Abilita Accessibilità per incollare", "Enable Accessibility to paste")) }
         }
     }
 
@@ -465,55 +600,76 @@ struct MenuView: View {
     @ObservedObject var state: AppState
     @ObservedObject var perm: PermissionsManager
     var onCheckUpdates: () -> Void = {}
+    var onRecordKey: () -> Void = {}
+
+    private func t(_ it: String, _ en: String) -> String { state.language.hasPrefix("it") ? it : en }
+
+    private var hint: String {
+        let k = state.binding.label
+        switch state.mode {
+        case .hold:   return t("Tieni premuto \(k) e parla. Rilascia per incollare.",
+                               "Hold \(k) and speak. Release to paste.")
+        case .toggle: return t("Premi \(k) per iniziare, ripremi per fermare e incollare.",
+                               "Press \(k) to start, press again to stop and paste.")
+        case .both:   return t("Tieni premuto per dettare al volo, oppure un tocco per iniziare e un altro per incollare.",
+                               "Hold to dictate on the fly, or tap once to start and again to paste.")
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Image(systemName: state.status.symbol)
-                Text("Dictat — \(state.status.label)")
-                    .font(.headline).lineLimit(1)
+                Text("Dictat — \(state.status.label)").font(.headline).lineLimit(1)
             }
 
-            Toggle("Abilita dettatura", isOn: $state.enabled)
+            Toggle(t("Abilita dettatura", "Enable dictation"), isOn: $state.enabled)
 
             if !allPerms {
                 Divider()
-                Text("Permessi mancanti").font(.caption).bold().foregroundStyle(.orange)
-                permRow("Microfono", perm.mic) { perm.requestMic() }
-                permRow("Riconoscimento vocale", perm.speech) { perm.requestSpeech() }
-                permRow("Accessibilità (per incollare)", perm.accessibility) { perm.requestAccessibility() }
-                permRow("Input Monitoring (hotkey globale)", perm.inputMonitoring) { perm.requestInputMonitoring() }
+                Text(t("Permessi mancanti", "Missing permissions")).font(.caption).bold().foregroundStyle(.orange)
+                permRow(t("Microfono", "Microphone"), perm.mic) { perm.requestMic() }
+                permRow(t("Riconoscimento vocale", "Speech Recognition"), perm.speech) { perm.requestSpeech() }
+                permRow(t("Accessibilità (per incollare)", "Accessibility (paste)"), perm.accessibility) { perm.requestAccessibility() }
+                permRow(t("Input Monitoring (hotkey globale)", "Input Monitoring (global hotkey)"), perm.inputMonitoring) { perm.requestInputMonitoring() }
             }
 
             Divider()
-            Picker("Tasto push-to-talk", selection: $state.hotkey) {
-                ForEach(HotKey.allCases) { Text($0.label).tag($0) }
+            Picker(t("Modalità", "Mode"), selection: $state.mode) {
+                Text(t("Tieni premuto", "Hold")).tag(ActivationMode.hold)
+                Text(t("Premi/ripremi", "Toggle")).tag(ActivationMode.toggle)
+                Text(t("Entrambe", "Both")).tag(ActivationMode.both)
             }
-            Picker("Lingua", selection: $state.language) {
+            HStack {
+                Text(t("Tasto", "Key"))
+                Spacer()
+                Text(state.binding.label).foregroundStyle(.secondary).lineLimit(1)
+                Button(t("Cambia…", "Change…")) { onRecordKey() }.controlSize(.small)
+            }
+            Picker(t("Lingua", "Language"), selection: $state.language) {
                 Text("🇮🇹 Italiano").tag("it-IT")
                 Text("🇬🇧 English").tag("en-US")
             }
-            Toggle("Solo riconoscimento on-device", isOn: $state.onDeviceOnly)
-            Toggle("Punteggiatura automatica", isOn: $state.autoPunctuation)
+            Toggle(t("Solo riconoscimento on-device", "On-device recognition only"), isOn: $state.onDeviceOnly)
+            Toggle(t("Punteggiatura automatica", "Automatic punctuation"), isOn: $state.autoPunctuation)
 
             if !state.lastTranscript.isEmpty {
                 Divider()
-                Text("Ultima trascrizione").font(.caption).foregroundStyle(.secondary)
+                Text(t("Ultima trascrizione", "Last transcript")).font(.caption).foregroundStyle(.secondary)
                 Text(state.lastTranscript).font(.caption).lineLimit(3)
                 HStack {
-                    Button("Copia") { NSPasteboard.general.clearContents()
+                    Button(t("Copia", "Copy")) { NSPasteboard.general.clearContents()
                         NSPasteboard.general.setString(state.lastTranscript, forType: .string) }
-                    Button("Incolla") { coord.pasteLast() }
+                    Button(t("Incolla", "Paste")) { coord.pasteLast() }
                 }
             }
 
             Divider()
-            Text("Tieni premuto **\(state.hotkey.label)** e parla. Rilascia per incollare.")
-                .font(.caption2).foregroundStyle(.secondary)
+            Text(hint).font(.caption2).foregroundStyle(.secondary)
             HStack {
-                Button("Controlla aggiornamenti…") { onCheckUpdates() }
+                Button(t("Controlla aggiornamenti…", "Check for updates…")) { onCheckUpdates() }
                 Spacer()
-                Button("Esci") { NSApp.terminate(nil) }
+                Button(t("Esci", "Quit")) { NSApp.terminate(nil) }
             }
         }
         .padding(14)
@@ -529,8 +685,55 @@ struct MenuView: View {
                 .foregroundStyle(ok ? .green : .red)
             Text(name).font(.caption)
             Spacer()
-            if !ok { Button("Abilita…", action: action).controlSize(.small) }
+            if !ok { Button(t("Abilita…", "Enable…"), action: action).controlSize(.small) }
         }
+    }
+}
+
+// MARK: - Key recorder (cattura qualsiasi tasto/modificatore)
+
+struct KeyRecorderView: View {
+    var body: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "keyboard").font(.largeTitle)
+            Text(L("Premi il tasto da usare per la dettatura", "Press the key to use for dictation"))
+                .multilineTextAlignment(.center)
+            Text(L("Esc per annullare", "Esc to cancel")).font(.caption).foregroundStyle(.secondary)
+        }
+        .padding(24).frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+/// Costruisce un KeyBinding dal primo evento utile (modificatore o tasto normale).
+func keyBinding(from ev: NSEvent) -> KeyBinding? {
+    let kc = Int(ev.keyCode)
+    if ev.type == .flagsChanged {
+        guard let flag = modifierFlag(forKeyCode: kc) else { return nil }
+        let m = ev.modifierFlags
+        let isOn: Bool
+        switch flag {
+        case .maskCommand:      isOn = m.contains(.command)
+        case .maskAlternate:    isOn = m.contains(.option)
+        case .maskControl:      isOn = m.contains(.control)
+        case .maskShift:        isOn = m.contains(.shift)
+        case .maskSecondaryFn:  isOn = m.contains(.function)
+        default:                isOn = false
+        }
+        guard isOn else { return nil } // cattura solo alla pressione
+        return KeyBinding(keyCode: kc, isModifier: true, modifierFlags: flag.rawValue,
+                          label: keyName(keyCode: kc, isModifier: true))
+    } else { // keyDown
+        var cg: CGEventFlags = []
+        var lbl = ""
+        if ev.modifierFlags.contains(.control) { cg.insert(.maskControl); lbl += "⌃" }
+        if ev.modifierFlags.contains(.option)  { cg.insert(.maskAlternate); lbl += "⌥" }
+        if ev.modifierFlags.contains(.shift)   { cg.insert(.maskShift); lbl += "⇧" }
+        if ev.modifierFlags.contains(.command) { cg.insert(.maskCommand); lbl += "⌘" }
+        var name = keyName(keyCode: kc, isModifier: false)
+        if name.hasPrefix("Key "), let ch = ev.charactersIgnoringModifiers, !ch.isEmpty {
+            name = ch.uppercased()
+        }
+        return KeyBinding(keyCode: kc, isModifier: false, modifierFlags: cg.rawValue, label: lbl + name)
     }
 }
 
