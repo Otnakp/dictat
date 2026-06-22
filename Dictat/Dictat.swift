@@ -202,6 +202,7 @@ private enum K {
     static let enabled = "enabled", lang = "language"
     static let onDevice = "onDeviceOnly", punct = "autoPunctuation"
     static let bindings = "keyBindings"
+    static let historyOn = "historyEnabled", history = "history"
 }
 
 final class AppState: ObservableObject {
@@ -215,6 +216,10 @@ final class AppState: ObservableObject {
     @Published var language: String      { didSet { d.set(language, forKey: K.lang) } }
     @Published var onDeviceOnly: Bool    { didSet { d.set(onDeviceOnly, forKey: K.onDevice) } }
     @Published var autoPunctuation: Bool { didSet { d.set(autoPunctuation, forKey: K.punct) } }
+    @Published var historyEnabled: Bool  { didSet { d.set(historyEnabled, forKey: K.historyOn) } }
+    @Published var history: [String]     { didSet { d.set(history, forKey: K.history) } }
+
+    static let maxHistory = 10
 
     init() {
         enabled = d.object(forKey: K.enabled) as? Bool ?? true
@@ -224,6 +229,17 @@ final class AppState: ObservableObject {
         language = d.string(forKey: K.lang) ?? "en-US"
         onDeviceOnly = d.object(forKey: K.onDevice) as? Bool ?? true
         autoPunctuation = d.object(forKey: K.punct) as? Bool ?? true
+        historyEnabled = d.object(forKey: K.historyOn) as? Bool ?? false   // OFF di default
+        history = d.stringArray(forKey: K.history) ?? []
+    }
+
+    func addHistory(_ s: String) {
+        let clean = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard historyEnabled, !clean.isEmpty else { return }
+        var h = history.filter { $0 != clean }
+        h.insert(clean, at: 0)
+        if h.count > Self.maxHistory { h = Array(h.prefix(Self.maxHistory)) }
+        history = h
     }
 
     func addBinding(_ b: KeyBinding) {
@@ -392,12 +408,13 @@ final class HotkeyManager {
 
 // MARK: - Speech
 
-/// Dettatura lunga: SFSpeechRecognizer segmenta sui silenzi e ha un limite (~1 min) per
-/// sessione, e `bestTranscription` riflette solo il segmento corrente. Per non perdere il
-/// testo precedente accumuliamo ogni segmento finalizzato e riavviamo una nuova sessione,
-/// continuando finché l'utente non rilascia.
+/// Trascrizione LIVE parola per parola: a ogni partial emettiamo il testo COMPLETO
+/// (segmenti già finalizzati + partial corrente) via onText, e il Coordinator aggiorna il
+/// campo con un diff (backspace + digitazione). Segmentiamo sul silenzio per non far
+/// scartare a SFSpeech il testo vecchio. Si continua finché l'utente non rilascia.
 final class SpeechTranscriber {
-    var onFinal: ((String) -> Void)?
+    var onText: ((String) -> Void)?     // testo completo aggiornato in tempo reale
+    var onDone: (() -> Void)?           // riconoscimento concluso (dopo il rilascio)
     var onError: ((String) -> Void)?
 
     private let recognizer: SFSpeechRecognizer?
@@ -406,9 +423,12 @@ final class SpeechTranscriber {
     private let lock = NSLock()
     private var accumulated = ""    // segmenti già finalizzati
     private var current = ""        // partial del segmento corrente
+    private var emittedAny = false
     private var done = false
     private var stopping = false    // l'utente ha rilasciato → finalizza
     private var fallback: DispatchWorkItem?
+    private var silenceWork: DispatchWorkItem?   // finalizza il segmento dopo una pausa
+    private let silenceGap: TimeInterval = 1.5
     private let onDeviceOnly: Bool
     private let punct: Bool
 
@@ -439,28 +459,57 @@ final class SpeechTranscriber {
             guard let self else { return }
             if let res = res {
                 self.lock.lock(); self.current = res.bestTranscription.formattedString; self.lock.unlock()
+                DispatchQueue.main.async { self.emitText(); self.scheduleSilenceFinalize() }
                 if res.isFinal { DispatchQueue.main.async { self.segmentEnded() } }
             }
             if let e = e { DispatchQueue.main.async { self.segmentError(e) } }
         }
     }
 
+    /// Se non arrivano nuovi risultati per `silenceGap` (= pausa) finalizziamo NOI il
+    /// segmento, così il testo prima della pausa è già "commesso" e SFSpeech non lo scarta.
+    private func scheduleSilenceFinalize() {
+        silenceWork?.cancel()
+        guard !stopping, !done else { return }
+        let w = DispatchWorkItem { [weak self] in
+            guard let self, !self.stopping, !self.done else { return }
+            self.lock.lock(); let hasText = !self.current.isEmpty; self.lock.unlock()
+            if hasText { self.req?.endAudio() }   // → isFinal → segmentEnded (commit + riparte)
+        }
+        silenceWork = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + silenceGap, execute: w)
+    }
+
     func append(_ b: AVAudioPCMBuffer) { req?.append(b) }
 
     func stopAndFinalize() {
         stopping = true
+        silenceWork?.cancel()
         req?.endAudio()
-        // Fallback: se non arriva isFinal entro 2.5s, chiudi con quel che c'è.
-        let w = DispatchWorkItem { [weak self] in self?.commitCurrent(); self?.complete() }
+        // Fallback: se non arriva isFinal entro 2.5s, chiudi.
+        let w = DispatchWorkItem { [weak self] in self?.finishUp() }
         fallback = w
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: w)
     }
 
-    func cancel() { done = true; fallback?.cancel(); task?.cancel(); task = nil; req = nil }
+    func cancel() { done = true; silenceWork?.cancel(); fallback?.cancel(); task?.cancel(); task = nil; req = nil }
 
     // --- tutto da qui gira su main ---
 
-    private func commitCurrent() {
+    private func target() -> String {
+        lock.lock(); defer { lock.unlock() }
+        if accumulated.isEmpty { return current }
+        if current.isEmpty { return accumulated }
+        return accumulated + " " + current
+    }
+
+    private func emitText() {
+        let t = target()
+        if !t.isEmpty { emittedAny = true }
+        onText?(t)
+    }
+
+    private func commit() {
         lock.lock()
         if !current.isEmpty {
             accumulated = accumulated.isEmpty ? current : accumulated + " " + current
@@ -470,37 +519,29 @@ final class SpeechTranscriber {
     }
 
     private func segmentEnded() {
-        commitCurrent()
+        commit(); emitText()
         let old = task
-        if stopping { old?.finish(); task = nil; req = nil; complete() }
-        else { startSegment(); old?.finish() }   // nuova sessione attiva subito → niente buco audio
+        if stopping { old?.finish(); task = nil; req = nil; finishUp() }
+        else { startSegment(); old?.finish() }   // nuova sessione subito → niente buco audio
     }
 
     private func segmentError(_ e: Error) {
-        commitCurrent()
+        commit(); emitText()
         let old = task
-        if stopping { old?.cancel(); task = nil; req = nil; complete(); return }
-        lock.lock(); let empty = accumulated.isEmpty; lock.unlock()
-        if empty { old?.cancel(); task = nil; req = nil; fail(e.localizedDescription) }  // nessun testo → errore vero
-        else { startSegment(); old?.cancel() }                                           // limite sessione → riparti
+        if stopping { old?.cancel(); task = nil; req = nil; finishUp(); return }
+        if emittedAny { startSegment(); old?.cancel() }                 // sessione finita → riparti
+        else { old?.cancel(); task = nil; req = nil; fail(e.localizedDescription) }  // nessun testo → errore vero
     }
 
-    private func text() -> String {
-        lock.lock()
-        let joined = current.isEmpty ? accumulated : (accumulated.isEmpty ? current : accumulated + " " + current)
-        lock.unlock()
-        return joined.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private func complete() {
+    private func finishUp() {
         guard !done else { return }
-        done = true; fallback?.cancel()
+        done = true; silenceWork?.cancel(); fallback?.cancel()
         task?.finish(); task = nil; req = nil
-        onFinal?(text())
+        onDone?()
     }
     private func fail(_ m: String) {
         guard !done else { return }
-        done = true; fallback?.cancel(); task?.cancel(); task = nil; req = nil
+        done = true; silenceWork?.cancel(); fallback?.cancel(); task?.cancel(); task = nil; req = nil
         onError?(m)
     }
     private func err(_ m: String) -> NSError { NSError(domain: "Dictat", code: 1,
@@ -525,6 +566,33 @@ final class PasteManager {
         down?.flags = .maskCommand; up?.flags = .maskCommand
         down?.post(tap: .cghidEventTap); up?.post(tap: .cghidEventTap)
     }
+
+    /// Digita testo Unicode direttamente (niente clipboard). flags vuoti così un eventuale
+    /// modificatore-trigger fisicamente premuto non altera i tasti sintetici.
+    func type(_ s: String) {
+        guard !s.isEmpty else { return }
+        let src = CGEventSource(stateID: .hidSystemState)
+        var u = Array(s.utf16)
+        let down = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: true)
+        down?.flags = []
+        down?.keyboardSetUnicodeString(stringLength: u.count, unicodeString: &u)
+        down?.post(tap: .cghidEventTap)
+        let up = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: false)
+        up?.flags = []
+        up?.keyboardSetUnicodeString(stringLength: u.count, unicodeString: &u)
+        up?.post(tap: .cghidEventTap)
+    }
+
+    func backspace(_ n: Int) {
+        guard n > 0 else { return }
+        let src = CGEventSource(stateID: .hidSystemState)
+        for _ in 0..<n {
+            let d = CGEvent(keyboardEventSource: src, virtualKey: CGKeyCode(kVK_Delete), keyDown: true)
+            d?.flags = []; d?.post(tap: .cghidEventTap)
+            let u = CGEvent(keyboardEventSource: src, virtualKey: CGKeyCode(kVK_Delete), keyDown: false)
+            u?.flags = []; u?.post(tap: .cghidEventTap)
+        }
+    }
 }
 
 // MARK: - Coordinator
@@ -539,6 +607,7 @@ final class Coordinator: ObservableObject {
     private var recording = false
     private var timer: Timer?
     private var lastInputMonitoring = false
+    private var visible = ""        // testo già digitato nel campo (per il diff live)
     // Gesture: hold = push-to-talk; doppio click = hands-free (start), altro doppio click = stop.
     // Entrambe sempre attive, senza setting di modalità.
     private let holdThreshold: TimeInterval = 0.3   // oltre = hold; sotto = tap
@@ -612,9 +681,18 @@ final class Coordinator: ObservableObject {
         guard perm.mic else { state.status = .error(L("Microfono non autorizzato", "Microphone not authorized")); perm.requestMic(); return }
         guard perm.speech else { state.status = .error(L("Speech non autorizzato", "Speech not authorized")); perm.requestSpeech(); return }
 
+        state.lastTranscript = ""; visible = ""
         let t = SpeechTranscriber(locale: Locale(identifier: state.language),
                                   onDeviceOnly: state.onDeviceOnly, punct: state.autoPunctuation)
-        t.onFinal = { [weak self] text in self?.finish(text) }
+        t.onText = { [weak self] text in self?.render(text) }                  // scrittura live parola per parola
+        t.onDone = { [weak self] in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if self.perm.accessibility && !self.visible.isEmpty { self.paster.type(" ") }  // separa dettati successivi
+                self.state.addHistory(self.state.lastTranscript)
+                self.transcriber = nil; self.state.status = .idle
+            }
+        }
         t.onError = { [weak self] msg in
             DispatchQueue.main.async { self?.state.status = .error(msg); self?.teardownEngine() }
         }
@@ -648,16 +726,24 @@ final class Coordinator: ObservableObject {
         if engine.isRunning { engine.stop() }
     }
 
-    private func finish(_ text: String) {
-        DispatchQueue.main.async {
-            self.transcriber = nil
-            self.state.status = .idle
-            let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !clean.isEmpty else { return }
-            self.state.lastTranscript = clean
-            if self.perm.accessibility { self.paster.paste(clean) }
-            else { self.paster.copy(clean); self.state.status = .error(L("Abilita Accessibilità per incollare", "Enable Accessibility to paste")) }
+    /// Aggiorna il campo col diff tra ciò che è già scritto (`visible`) e il nuovo testo:
+    /// cancella la coda cambiata e digita il resto → scrittura live parola per parola.
+    private func render(_ target: String) {
+        guard perm.accessibility else {
+            paster.copy(target); state.lastTranscript = target
+            state.status = .error(L("Abilita Accessibilità per scrivere", "Enable Accessibility to type"))
+            return
         }
+        let v = Array(visible), t = Array(target)
+        var common = 0
+        let n = min(v.count, t.count)
+        while common < n && v[common] == t[common] { common += 1 }
+        let deletes = v.count - common
+        if deletes > 0 { paster.backspace(deletes) }
+        let suffix = String(t[common...])
+        if !suffix.isEmpty { paster.type(suffix) }
+        visible = target
+        state.lastTranscript = target
     }
 
     func pasteLast() {
@@ -679,6 +765,7 @@ struct MenuView: View {
     var autoUpdateSet: (Bool) -> Void = { _ in }
 
     private func t(_ it: String, _ en: String) -> String { state.language.hasPrefix("it") ? it : en }
+    private func copy(_ s: String) { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(s, forType: .string) }
 
     private var hint: String {
         t("Tieni premuto un trigger e parla (rilascia per incollare), oppure doppio click per iniziare e doppio click per fermare.",
@@ -735,15 +822,32 @@ struct MenuView: View {
             Toggle(t("Punteggiatura automatica", "Automatic punctuation"), isOn: $state.autoPunctuation)
             Toggle(t("Aggiornamenti automatici", "Automatic updates"),
                    isOn: Binding(get: autoUpdateGet, set: autoUpdateSet))
+            Toggle(t("Salva cronologia", "Save history"), isOn: $state.historyEnabled)
 
             if !state.lastTranscript.isEmpty {
                 Divider()
                 Text(t("Ultima trascrizione", "Last transcript")).font(.caption).foregroundStyle(.secondary)
                 Text(state.lastTranscript).font(.caption).lineLimit(3)
                 HStack {
-                    Button(t("Copia", "Copy")) { NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(state.lastTranscript, forType: .string) }
+                    Button(t("Copia", "Copy")) { copy(state.lastTranscript) }
                     Button(t("Incolla", "Paste")) { coord.pasteLast() }
+                }
+            }
+
+            if state.historyEnabled && !state.history.isEmpty {
+                Divider()
+                HStack {
+                    Text(t("Cronologia", "History")).font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Button(t("Svuota", "Clear")) { state.history = [] }.controlSize(.small)
+                }
+                ForEach(Array(state.history.enumerated()), id: \.offset) { _, item in
+                    HStack {
+                        Text(item).font(.caption).lineLimit(1)
+                        Spacer()
+                        Button { copy(item) } label: { Image(systemName: "doc.on.doc") }
+                            .buttonStyle(.borderless)
+                    }
                 }
             }
 
