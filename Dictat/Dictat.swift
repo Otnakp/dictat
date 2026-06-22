@@ -57,7 +57,12 @@ final class StatusBarController: NSObject {
         popover.contentViewController = NSHostingController(
             rootView: MenuView(coord: coord, state: coord.state, perm: coord.perm,
                                onCheckUpdates: { [weak self] in self?.updater.checkForUpdates(nil) },
-                               onRecordKey: { [weak self] in self?.recordKey() }))
+                               onRecordKey: { [weak self] in self?.recordKey() },
+                               autoUpdateGet: { [weak self] in self?.updater.updater.automaticallyChecksForUpdates ?? false },
+                               autoUpdateSet: { [weak self] on in
+                                   self?.updater.updater.automaticallyChecksForUpdates = on
+                                   self?.updater.updater.automaticallyDownloadsUpdates = on
+                               }))
 
         // Il glifo dell'icona segue lo stato (idle/recording/transcribing/error).
         coord.state.$status
@@ -466,17 +471,18 @@ final class SpeechTranscriber {
 
     private func segmentEnded() {
         commitCurrent()
-        task?.finish(); task = nil; req = nil
-        if stopping { complete() } else { startSegment() }   // continua il dettato
+        let old = task
+        if stopping { old?.finish(); task = nil; req = nil; complete() }
+        else { startSegment(); old?.finish() }   // nuova sessione attiva subito → niente buco audio
     }
 
     private func segmentError(_ e: Error) {
         commitCurrent()
-        task?.cancel(); task = nil; req = nil
-        if stopping { complete(); return }
+        let old = task
+        if stopping { old?.cancel(); task = nil; req = nil; complete(); return }
         lock.lock(); let empty = accumulated.isEmpty; lock.unlock()
-        if empty { fail(e.localizedDescription) }            // nessun testo → errore vero
-        else { startSegment() }                              // limite di sessione → riparti
+        if empty { old?.cancel(); task = nil; req = nil; fail(e.localizedDescription) }  // nessun testo → errore vero
+        else { startSegment(); old?.cancel() }                                           // limite sessione → riparti
     }
 
     private func text() -> String {
@@ -669,6 +675,8 @@ struct MenuView: View {
     @ObservedObject var perm: PermissionsManager
     var onCheckUpdates: () -> Void = {}
     var onRecordKey: () -> Void = {}
+    var autoUpdateGet: () -> Bool = { false }
+    var autoUpdateSet: (Bool) -> Void = { _ in }
 
     private func t(_ it: String, _ en: String) -> String { state.language.hasPrefix("it") ? it : en }
 
@@ -725,6 +733,8 @@ struct MenuView: View {
             }
             Toggle(t("Solo riconoscimento on-device", "On-device recognition only"), isOn: $state.onDeviceOnly)
             Toggle(t("Punteggiatura automatica", "Automatic punctuation"), isOn: $state.autoPunctuation)
+            Toggle(t("Aggiornamenti automatici", "Automatic updates"),
+                   isOn: Binding(get: autoUpdateGet, set: autoUpdateSet))
 
             if !state.lastTranscript.isEmpty {
                 Divider()
