@@ -408,27 +408,27 @@ final class HotkeyManager {
 
 // MARK: - Speech
 
-/// Trascrizione LIVE parola per parola: a ogni partial emettiamo il testo COMPLETO
-/// (segmenti già finalizzati + partial corrente) via onText, e il Coordinator aggiorna il
-/// campo con un diff (backspace + digitazione). Segmentiamo sul silenzio per non far
-/// scartare a SFSpeech il testo vecchio. Si continua finché l'utente non rilascia.
+/// Trascrizione LIVE parola per parola con UN SOLO task continuo.
+/// SFSpeech dopo una pausa segna la fine dell'utterance con `speechRecognitionMetadata != nil`
+/// e fa RIPARTIRE `formattedString` da zero (solo la nuova frase). Quindi: a ogni risultato
+/// emettiamo la coda dell'utterance corrente (onTail, diffata dal Coordinator); quando arriva
+/// la metadata consolidiamo (onCommit) — il testo consolidato non viene MAI più toccato, e la
+/// nuova utterance riparte pulita. Niente restart sul silenzio (era la fonte delle race/perdite):
+/// si riavvia il task SOLO al limite di sessione (~1 min) o su errore, con generation guard.
 final class SpeechTranscriber {
-    var onText: ((String) -> Void)?     // testo completo aggiornato in tempo reale
+    var onTail: ((String) -> Void)?     // coda dell'utterance corrente (può cambiare)
+    var onCommit: (() -> Void)?         // utterance finita → consolida e separa
     var onDone: (() -> Void)?           // riconoscimento concluso (dopo il rilascio)
     var onError: ((String) -> Void)?
 
     private let recognizer: SFSpeechRecognizer?
     private var task: SFSpeechRecognitionTask?
     private var req: SFSpeechAudioBufferRecognitionRequest?
-    private let lock = NSLock()
-    private var accumulated = ""    // segmenti già finalizzati
-    private var current = ""        // partial del segmento corrente
+    private var generation = 0      // id del task: scarta i callback dei task superati
     private var emittedAny = false
     private var done = false
     private var stopping = false    // l'utente ha rilasciato → finalizza
     private var fallback: DispatchWorkItem?
-    private var silenceWork: DispatchWorkItem?   // finalizza il segmento dopo una pausa
-    private let silenceGap: TimeInterval = 1.5
     private let onDeviceOnly: Bool
     private let punct: Bool
 
@@ -445,103 +445,76 @@ final class SpeechTranscriber {
         if onDeviceOnly && !r.supportsOnDeviceRecognition {
             throw err(L("On-device non disponibile. Disattiva \"Solo on-device\".", "On-device unavailable. Turn off \"On-device only\"."))
         }
-        startSegment()
+        startTask()
     }
 
-    private func startSegment() {
+    private func startTask() {
         guard let r = recognizer else { return }
+        generation &+= 1
+        let gen = generation
         let q = SFSpeechAudioBufferRecognitionRequest()
         q.shouldReportPartialResults = true
         if #available(macOS 13, *) { q.addsPunctuation = punct }
         q.requiresOnDeviceRecognition = onDeviceOnly ? true : r.supportsOnDeviceRecognition
         req = q
+        // Tutto sul main + generation guard: i callback di un task superato/finito sono ignorati.
         task = r.recognitionTask(with: q) { [weak self] res, e in
             guard let self else { return }
-            if let res = res {
-                self.lock.lock(); self.current = res.bestTranscription.formattedString; self.lock.unlock()
-                DispatchQueue.main.async { self.emitText(); self.scheduleSilenceFinalize() }
-                if res.isFinal { DispatchQueue.main.async { self.segmentEnded() } }
+            let text = res?.bestTranscription.formattedString
+            let hasMeta = res?.speechRecognitionMetadata != nil
+            let isFinal = res?.isFinal ?? false
+            DispatchQueue.main.async {
+                guard gen == self.generation, !self.done else { return }
+                if let text = text {
+                    if !text.isEmpty { self.emittedAny = true; self.onTail?(text) }  // niente wipe su vuoto
+                    if isFinal {                             // fine sessione (rilascio o limite)
+                        self.onCommit?()
+                        if self.stopping { self.finishUp() } else { self.restart() }
+                    } else if hasMeta {                      // fine utterance → consolida, continua
+                        self.onCommit?()
+                    }
+                }
+                if let e = e {
+                    if self.stopping { self.onCommit?(); self.finishUp() }
+                    else if self.emittedAny { self.onCommit?(); self.restart() }  // limite ~1 min → continua
+                    else { self.fail(e.localizedDescription) }                    // nessun testo → errore vero
+                }
             }
-            if let e = e { DispatchQueue.main.async { self.segmentError(e) } }
         }
     }
 
-    /// Se non arrivano nuovi risultati per `silenceGap` (= pausa) finalizziamo NOI il
-    /// segmento, così il testo prima della pausa è già "commesso" e SFSpeech non lo scarta.
-    private func scheduleSilenceFinalize() {
-        silenceWork?.cancel()
-        guard !stopping, !done else { return }
-        let w = DispatchWorkItem { [weak self] in
-            guard let self, !self.stopping, !self.done else { return }
-            self.lock.lock(); let hasText = !self.current.isEmpty; self.lock.unlock()
-            if hasText { self.req?.endAudio() }   // → isFinal → segmentEnded (commit + riparte)
-        }
-        silenceWork = w
-        DispatchQueue.main.asyncAfter(deadline: .now() + silenceGap, execute: w)
+    /// Riavvia il task (solo al limite di sessione/errore) preservando il testo consolidato.
+    private func restart() {
+        let old = task
+        startTask()         // nuovo task subito (req aggiornato) → minimo buco audio
+        old?.finish()
     }
 
     func append(_ b: AVAudioPCMBuffer) { req?.append(b) }
 
     func stopAndFinalize() {
         stopping = true
-        silenceWork?.cancel()
         req?.endAudio()
-        // Fallback: se non arriva isFinal entro 2.5s, chiudi.
-        let w = DispatchWorkItem { [weak self] in self?.finishUp() }
+        // Fallback: se non arriva isFinal entro 2.5s, consolida e chiudi.
+        let w = DispatchWorkItem { [weak self] in
+            guard let self, !self.done else { return }
+            self.onCommit?(); self.finishUp()
+        }
         fallback = w
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: w)
     }
 
-    func cancel() { done = true; silenceWork?.cancel(); fallback?.cancel(); task?.cancel(); task = nil; req = nil }
-
-    // --- tutto da qui gira su main ---
-
-    private func target() -> String {
-        lock.lock(); defer { lock.unlock() }
-        if accumulated.isEmpty { return current }
-        if current.isEmpty { return accumulated }
-        return accumulated + " " + current
-    }
-
-    private func emitText() {
-        let t = target()
-        if !t.isEmpty { emittedAny = true }
-        onText?(t)
-    }
-
-    private func commit() {
-        lock.lock()
-        if !current.isEmpty {
-            accumulated = accumulated.isEmpty ? current : accumulated + " " + current
-            current = ""
-        }
-        lock.unlock()
-    }
-
-    private func segmentEnded() {
-        commit(); emitText()
-        let old = task
-        if stopping { old?.finish(); task = nil; req = nil; finishUp() }
-        else { startSegment(); old?.finish() }   // nuova sessione subito → niente buco audio
-    }
-
-    private func segmentError(_ e: Error) {
-        commit(); emitText()
-        let old = task
-        if stopping { old?.cancel(); task = nil; req = nil; finishUp(); return }
-        if emittedAny { startSegment(); old?.cancel() }                 // sessione finita → riparti
-        else { old?.cancel(); task = nil; req = nil; fail(e.localizedDescription) }  // nessun testo → errore vero
-    }
+    func cancel() { done = true; generation &+= 1; fallback?.cancel(); task?.cancel(); task = nil; req = nil }
 
     private func finishUp() {
         guard !done else { return }
-        done = true; silenceWork?.cancel(); fallback?.cancel()
+        done = true; fallback?.cancel()
         task?.finish(); task = nil; req = nil
         onDone?()
     }
     private func fail(_ m: String) {
         guard !done else { return }
-        done = true; silenceWork?.cancel(); fallback?.cancel(); task?.cancel(); task = nil; req = nil
+        done = true; fallback?.cancel(); task?.cancel(); task = nil; req = nil
         onError?(m)
     }
     private func err(_ m: String) -> NSError { NSError(domain: "Dictat", code: 1,
@@ -607,7 +580,8 @@ final class Coordinator: ObservableObject {
     private var recording = false
     private var timer: Timer?
     private var lastInputMonitoring = false
-    private var visible = ""        // testo già digitato nel campo (per il diff live)
+    private var tail = ""           // coda del segmento corrente già digitata (diff live)
+    private var committedText = ""  // testo consolidato di questa sessione (mai cancellato)
     // Gesture: hold = push-to-talk; doppio click = hands-free (start), altro doppio click = stop.
     // Entrambe sempre attive, senza setting di modalità.
     private let holdThreshold: TimeInterval = 0.3   // oltre = hold; sotto = tap
@@ -681,15 +655,15 @@ final class Coordinator: ObservableObject {
         guard perm.mic else { state.status = .error(L("Microfono non autorizzato", "Microphone not authorized")); perm.requestMic(); return }
         guard perm.speech else { state.status = .error(L("Speech non autorizzato", "Speech not authorized")); perm.requestSpeech(); return }
 
-        state.lastTranscript = ""; visible = ""
+        state.lastTranscript = ""; tail = ""; committedText = ""
         let t = SpeechTranscriber(locale: Locale(identifier: state.language),
                                   onDeviceOnly: state.onDeviceOnly, punct: state.autoPunctuation)
-        t.onText = { [weak self] text in self?.render(text) }                  // scrittura live parola per parola
+        t.onTail = { [weak self] s in self?.renderTail(s) }      // scrittura live (solo la coda)
+        t.onCommit = { [weak self] in self?.commitTail() }       // consolida: non più toccato
         t.onDone = { [weak self] in
             DispatchQueue.main.async {
                 guard let self else { return }
-                if self.perm.accessibility && !self.visible.isEmpty { self.paster.type(" ") }  // separa dettati successivi
-                self.state.addHistory(self.state.lastTranscript)
+                self.state.addHistory(self.committedText)
                 self.transcriber = nil; self.state.status = .idle
             }
         }
@@ -726,15 +700,14 @@ final class Coordinator: ObservableObject {
         if engine.isRunning { engine.stop() }
     }
 
-    /// Aggiorna il campo col diff tra ciò che è già scritto (`visible`) e il nuovo testo:
-    /// cancella la coda cambiata e digita il resto → scrittura live parola per parola.
-    private func render(_ target: String) {
+    /// Aggiorna SOLO la coda del segmento corrente col diff (backspace della parte cambiata +
+    /// digita il resto). Il testo consolidato non viene mai toccato → impossibile perderlo.
+    private func renderTail(_ s: String) {
         guard perm.accessibility else {
-            paster.copy(target); state.lastTranscript = target
             state.status = .error(L("Abilita Accessibilità per scrivere", "Enable Accessibility to type"))
             return
         }
-        let v = Array(visible), t = Array(target)
+        let v = Array(tail), t = Array(s)
         var common = 0
         let n = min(v.count, t.count)
         while common < n && v[common] == t[common] { common += 1 }
@@ -742,8 +715,19 @@ final class Coordinator: ObservableObject {
         if deletes > 0 { paster.backspace(deletes) }
         let suffix = String(t[common...])
         if !suffix.isEmpty { paster.type(suffix) }
-        visible = target
-        state.lastTranscript = target
+        tail = s
+        state.lastTranscript = committedText + tail
+    }
+
+    /// La coda è definitiva: aggiungi un separatore e "consolidala" (non più diffata).
+    private func commitTail() {
+        guard perm.accessibility else { return }
+        if !tail.isEmpty {
+            paster.type(" ")
+            committedText += tail + " "
+        }
+        tail = ""
+        state.lastTranscript = committedText
     }
 
     func pasteLast() {
