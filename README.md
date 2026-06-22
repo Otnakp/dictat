@@ -106,7 +106,7 @@ your login keychain. The Homebrew cask is [`Casks/dictat.rb`](Casks/dictat.rb) (
 
 - **Hotkey only works when Dictat is focused** → grant **Input Monitoring**.
 - **Doesn't paste** but text is on the clipboard → grant **Accessibility**, or paste manually.
-- **Permission toggle won't stick** → stale TCC entries; `tccutil reset Accessibility com.local.dictat` and re-grant.
+- **Permission toggle won't stick** → stale TCC entries; `tccutil reset Accessibility com.otnakp.dictat` and re-grant.
 - **"On-device unavailable"** → the language model isn't installed; turn off "on-device only".
 - Some terminals block synthesized paste; copy from the popover and paste manually.
 

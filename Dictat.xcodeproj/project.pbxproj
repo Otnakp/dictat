@@ -190,7 +190,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = "com.local.dictat";
+				PRODUCT_BUNDLE_IDENTIFIER = "com.otnakp.dictat";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_STRICT_CONCURRENCY = minimal;
 			};
@@ -214,7 +214,7 @@
 				);
 				ONLY_ACTIVE_ARCH = NO;
 				ARCHS = "arm64 x86_64";
-				PRODUCT_BUNDLE_IDENTIFIER = "com.local.dictat";
+				PRODUCT_BUNDLE_IDENTIFIER = "com.otnakp.dictat";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_STRICT_CONCURRENCY = minimal;
 			};

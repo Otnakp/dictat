@@ -14,6 +14,6 @@ cask "dictat" do
   app "Dictat.app"
 
   zap trash: [
-    "~/Library/Preferences/com.local.dictat.plist",
+    "~/Library/Preferences/com.otnakp.dictat.plist",
   ]
 end

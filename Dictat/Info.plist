@@ -7,7 +7,7 @@
     <key>CFBundleDisplayName</key>
     <string>Dictat</string>
     <key>CFBundleIdentifier</key>
-    <string>com.local.dictat</string>
+    <string>com.otnakp.dictat</string>
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>CFBundleShortVersionString</key>
