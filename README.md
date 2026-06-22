@@ -24,7 +24,7 @@ Lives only in the menu bar. All code in one file:
 ### Homebrew (recommended)
 
 ```bash
-brew tap otnakp/dictat            # adds the otnakp/homebrew-dictat tap
+brew tap otnakp/dictat 
 brew install --cask dictat
 ```
 
