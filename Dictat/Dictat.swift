@@ -735,6 +735,10 @@ struct KeyRecorderView: View {
             Text(L("Premi il tasto, il modificatore o il pulsante del mouse da usare",
                    "Press the key, modifier, or mouse button to use"))
                 .multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
+            Text(L("? I pulsanti del mouse potrebbero non funzionare con alcuni mouse (driver come Logi Options+ che li intercettano).",
+                   "? Mouse buttons may not work with some mice (drivers like Logi Options+ can intercept them)."))
+                .font(.caption2).foregroundStyle(.secondary)
+                .multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
             Text(L("Esc per annullare", "Esc to cancel")).font(.caption).foregroundStyle(.secondary)
         }
         .padding(24)
