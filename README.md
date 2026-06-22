@@ -30,10 +30,6 @@ brew install --cask dictat
 
 Once you install, notice the small microphone icon on the top bar. That's Dictat.
 
-```bash
-brew trust otnakp/dictat
-brew install --cask dictat
-```
 
 ### Manual
 
