@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="Dictat" width="420">
+</p>
+
 # Dictat
 
 Native macOS **push-to-talk dictation** in the menu bar. Like Wispr Flow, but **free, local, open source**.
