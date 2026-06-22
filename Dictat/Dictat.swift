@@ -87,16 +87,17 @@ final class StatusBarController: NSObject {
     func recordKey() {
         guard recorderWindow == nil else { return }
         popover.performClose(nil)
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 150),
-                         styleMask: [.titled], backing: .buffered, defer: false)
-        w.title = L("Registra tasto", "Record key")
-        w.contentViewController = NSHostingController(rootView: KeyRecorderView())
+        let vc = NSHostingController(rootView: KeyRecorderView())
+        let w = NSWindow(contentRect: .zero, styleMask: [.titled], backing: .buffered, defer: false)
+        w.title = L("Registra trigger", "Record trigger")
+        w.contentViewController = vc
+        w.setContentSize(vc.view.fittingSize)   // si adatta al testo
         w.center(); w.level = .floating; w.isReleasedWhenClosed = false
         recorderWindow = w
         NSApp.activate(ignoringOtherApps: true)
         w.makeKeyAndOrderFront(nil)
 
-        recorderMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] ev in
+        recorderMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged, .otherMouseDown]) { [weak self] ev in
             guard let self else { return ev }
             if ev.type == .keyDown && ev.keyCode == 53 { self.finishRecording(nil); return nil } // Esc
             if let b = keyBinding(from: ev) { self.finishRecording(b); return nil }
@@ -106,7 +107,7 @@ final class StatusBarController: NSObject {
 
     private func finishRecording(_ binding: KeyBinding?) {
         if let m = recorderMonitor { NSEvent.removeMonitor(m); recorderMonitor = nil }
-        if let binding { coord.state.binding = binding }
+        if let binding { coord.state.addBinding(binding) }
         recorderWindow?.close(); recorderWindow = nil
     }
 }
@@ -139,10 +140,12 @@ enum Status: Equatable {
     }
 }
 
-/// Tasto push-to-talk configurabile: qualsiasi modificatore o tasto normale.
-struct KeyBinding: Codable, Equatable {
-    var keyCode: Int
+/// Trigger push-to-talk configurabile: modificatore, tasto normale o pulsante del mouse.
+struct KeyBinding: Codable, Equatable, Identifiable {
+    var id = UUID()
+    var keyCode: Int            // keycode tastiera, oppure numero pulsante mouse se isMouse
     var isModifier: Bool
+    var isMouse: Bool = false
     var modifierFlags: UInt64   // CGEventFlags raw: per i modificatori è il flag del tasto stesso;
                                 // per i tasti normali sono i modificatori richiesti (es. ⌃).
     var label: String
@@ -186,7 +189,7 @@ func keyName(keyCode kc: Int, isModifier: Bool) -> String {
 private enum K {
     static let enabled = "enabled", lang = "language"
     static let onDevice = "onDeviceOnly", punct = "autoPunctuation"
-    static let binding = "keyBinding"
+    static let bindings = "keyBindings"
 }
 
 final class AppState: ObservableObject {
@@ -194,20 +197,30 @@ final class AppState: ObservableObject {
     @Published var status: Status = .idle
     @Published var isRecording = false
     @Published var lastTranscript = ""
+    static let maxBindings = 5
     @Published var enabled: Bool         { didSet { d.set(enabled, forKey: K.enabled) } }
-    @Published var binding: KeyBinding   { didSet { if let v = try? JSONEncoder().encode(binding) { d.set(v, forKey: K.binding) } } }
+    @Published var bindings: [KeyBinding] { didSet { if let v = try? JSONEncoder().encode(bindings) { d.set(v, forKey: K.bindings) } } }
     @Published var language: String      { didSet { d.set(language, forKey: K.lang) } }
     @Published var onDeviceOnly: Bool    { didSet { d.set(onDeviceOnly, forKey: K.onDevice) } }
     @Published var autoPunctuation: Bool { didSet { d.set(autoPunctuation, forKey: K.punct) } }
 
     init() {
         enabled = d.object(forKey: K.enabled) as? Bool ?? true
-        if let v = d.data(forKey: K.binding), let b = try? JSONDecoder().decode(KeyBinding.self, from: v) {
-            binding = b
-        } else { binding = .rightOption }
+        if let v = d.data(forKey: K.bindings), let b = try? JSONDecoder().decode([KeyBinding].self, from: v), !b.isEmpty {
+            bindings = b
+        } else { bindings = [.rightOption] }
         language = d.string(forKey: K.lang) ?? "en-US"
         onDeviceOnly = d.object(forKey: K.onDevice) as? Bool ?? true
         autoPunctuation = d.object(forKey: K.punct) as? Bool ?? true
+    }
+
+    func addBinding(_ b: KeyBinding) {
+        guard bindings.count < Self.maxBindings else { return }
+        bindings.append(b)
+    }
+    func removeBinding(_ b: KeyBinding) {
+        guard bindings.count > 1 else { return }   // almeno un trigger
+        bindings.removeAll { $0.id == b.id }
     }
 }
 
@@ -275,12 +288,13 @@ private func hotkeyCallback(proxy: CGEventTapProxy, type: CGEventType,
 final class HotkeyManager {
     var onPress: (() -> Void)?
     var onRelease: (() -> Void)?
-    var bindingProvider: (() -> KeyBinding)?
+    var bindingsProvider: (() -> [KeyBinding])?
     var enabledProvider: (() -> Bool)?
 
     private var tap: CFMachPort?
     private var src: CFRunLoopSource?
-    private var down = false
+    private var downSet = Set<Int>()   // trigger attualmente premuti (per signature)
+    private var anyDown = false
     var isRunning: Bool { tap != nil }
 
     /// Richiede Input Monitoring; ritorna nil finché non concesso.
@@ -288,7 +302,9 @@ final class HotkeyManager {
         guard tap == nil else { return }
         let mask = CGEventMask((1 << CGEventType.flagsChanged.rawValue)
                              | (1 << CGEventType.keyDown.rawValue)
-                             | (1 << CGEventType.keyUp.rawValue))
+                             | (1 << CGEventType.keyUp.rawValue)
+                             | (1 << CGEventType.otherMouseDown.rawValue)
+                             | (1 << CGEventType.otherMouseUp.rawValue))
         let refcon = Unmanaged.passUnretained(self).toOpaque()
         guard let t = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
                                         options: .defaultTap, eventsOfInterest: mask,
@@ -302,7 +318,7 @@ final class HotkeyManager {
     func stop() {
         if let src { CFRunLoopRemoveSource(CFRunLoopGetCurrent(), src, .commonModes) }
         if let tap { CGEvent.tapEnable(tap: tap, enable: false) }
-        src = nil; tap = nil; down = false
+        src = nil; tap = nil; downSet.removeAll(); anyDown = false
     }
 
     /// Ricrea il tap: serve dopo che Input Monitoring viene concesso, così il tap
@@ -311,45 +327,54 @@ final class HotkeyManager {
 
     private let modMask: CGEventFlags = [.maskCommand, .maskControl, .maskAlternate, .maskShift]
 
-    /// Ritorna true se l'evento va consumato (non propagato all'app in focus).
+    private func signature(_ b: KeyBinding) -> Int {
+        if b.isMouse { return 100_000 + b.keyCode }
+        if b.isModifier { return 200_000 + Int(truncatingIfNeeded: b.modifierFlags) &+ b.keyCode } // distingue L/R
+        return b.keyCode
+    }
+
+    /// Ritorna true se l'evento va consumato (tasto normale o pulsante mouse usato come trigger).
     func handle(_ type: CGEventType, _ event: CGEvent) -> Bool {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             if let t = tap { CGEvent.tapEnable(tap: t, enable: true) }
             return false
         }
-        guard enabledProvider?() ?? true else {
-            if down { down = false; onRelease?() }
-            return false
-        }
-        let b = bindingProvider?() ?? .rightOption
         let kc = Int(event.getIntegerValueField(.keyboardEventKeycode))
+        let button = Int(event.getIntegerValueField(.mouseEventButtonNumber))
         let flags = event.flags
+        var consume = false
 
-        if b.isModifier {
-            guard type == .flagsChanged else { return false }
-            let flag = CGEventFlags(rawValue: b.modifierFlags)
-            let active: Bool
-            if flag.contains(.maskSecondaryFn) {
-                active = flags.contains(.maskSecondaryFn)            // fn: solo il flag
-            } else {
-                active = (kc == b.keyCode) ? flags.contains(flag) : down  // gate sul keycode (L/R)
+        if enabledProvider?() ?? true {
+            for b in (bindingsProvider?() ?? [.rightOption]) {
+                let sig = signature(b)
+                if b.isMouse {
+                    guard (type == .otherMouseDown || type == .otherMouseUp), button == b.keyCode else { continue }
+                    if type == .otherMouseDown { downSet.insert(sig) } else { downSet.remove(sig) }
+                    consume = true
+                } else if b.isModifier {
+                    guard type == .flagsChanged else { continue }
+                    let flag = CGEventFlags(rawValue: b.modifierFlags)
+                    guard flag.contains(.maskSecondaryFn) || kc == b.keyCode else { continue }
+                    if flags.contains(flag) { downSet.insert(sig) } else { downSet.remove(sig) }
+                    // i modificatori non si consumano
+                } else {
+                    guard (type == .keyDown || type == .keyUp), kc == b.keyCode else { continue }
+                    let need = CGEventFlags(rawValue: b.modifierFlags).intersection(modMask)
+                    if type == .keyDown, flags.intersection(modMask).isSuperset(of: need) {
+                        downSet.insert(sig)
+                    } else if type == .keyUp {
+                        downSet.remove(sig)
+                    }
+                    consume = true
+                }
             }
-            if active != down { down = active; active ? onPress?() : onRelease?() }
-            return false // i modificatori non digitano: non li consumiamo
+        } else {
+            downSet.removeAll()
         }
 
-        // Tasto normale: keyDown/keyUp, con i modificatori richiesti.
-        guard kc == b.keyCode else { return false }
-        let need = CGEventFlags(rawValue: b.modifierFlags).intersection(modMask)
-        if type == .keyDown {
-            guard flags.intersection(modMask).isSuperset(of: need) else { return false }
-            if !down { down = true; onPress?() }
-            return true
-        } else if type == .keyUp {
-            if down { down = false; onRelease?() }
-            return true
-        }
-        return false
+        let now = !downSet.isEmpty
+        if now != anyDown { anyDown = now; now ? onPress?() : onRelease?() }
+        return consume
     }
 }
 
@@ -477,7 +502,7 @@ final class Coordinator: ObservableObject {
     init() {
         hotkeys.onPress = { [weak self] in self?.handlePress() }
         hotkeys.onRelease = { [weak self] in self?.handleRelease() }
-        hotkeys.bindingProvider = { [weak self] in self?.state.binding ?? .rightOption }
+        hotkeys.bindingsProvider = { [weak self] in self?.state.bindings ?? [.rightOption] }
         hotkeys.enabledProvider = { [weak self] in self?.state.enabled ?? false }
         tick()
         timer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in self?.tick() }
@@ -604,9 +629,8 @@ struct MenuView: View {
     private func t(_ it: String, _ en: String) -> String { state.language.hasPrefix("it") ? it : en }
 
     private var hint: String {
-        let k = state.binding.label
-        return t("Tieni premuto \(k) e parla (rilascia per incollare), oppure doppio click per iniziare e doppio click per fermare.",
-                 "Hold \(k) and speak (release to paste), or double-press to start and double-press to stop.")
+        t("Tieni premuto un trigger e parla (rilascia per incollare), oppure doppio click per iniziare e doppio click per fermare.",
+          "Hold a trigger and speak (release to paste), or double-press to start and double-press to stop.")
     }
 
     var body: some View {
@@ -628,24 +652,31 @@ struct MenuView: View {
             }
 
             Divider()
-            Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 10) {
-                GridRow {
-                    Text(t("Tasto", "Key"))
+            VStack(alignment: .leading, spacing: 6) {
+                Text(t("Trigger (max 5)", "Triggers (max 5)")).font(.caption).foregroundStyle(.secondary)
+                ForEach(state.bindings) { b in
                     HStack(spacing: 8) {
-                        Button(t("Cambia…", "Change…")) { onRecordKey() }.controlSize(.small)
+                        Image(systemName: b.isMouse ? "computermouse" : "keyboard").foregroundStyle(.secondary)
+                        Text(b.label).lineLimit(1)
                         Spacer()
-                        Text(state.binding.label).foregroundStyle(.secondary).lineLimit(1)
-                    }.frame(maxWidth: .infinity)
-                }
-                GridRow {
-                    Text(t("Lingua", "Language"))
-                    Picker("", selection: $state.language) {
-                        Text("🇮🇹 Italiano").tag("it-IT")
-                        Text("🇬🇧 English").tag("en-US")
+                        if state.bindings.count > 1 {
+                            Button { state.removeBinding(b) } label: { Image(systemName: "minus.circle.fill") }
+                                .buttonStyle(.borderless).foregroundStyle(.red)
+                        }
                     }
-                    .labelsHidden()
-                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
+                if state.bindings.count < AppState.maxBindings {
+                    Button(t("Aggiungi trigger…", "Add trigger…")) { onRecordKey() }.controlSize(.small)
+                }
+            }
+
+            HStack {
+                Text(t("Lingua", "Language"))
+                Picker("", selection: $state.language) {
+                    Text("🇮🇹 Italiano").tag("it-IT")
+                    Text("🇬🇧 English").tag("en-US")
+                }.labelsHidden().fixedSize()
+                Spacer()
             }
             Toggle(t("Solo riconoscimento on-device", "On-device recognition only"), isOn: $state.onDeviceOnly)
             Toggle(t("Punteggiatura automatica", "Automatic punctuation"), isOn: $state.autoPunctuation)
@@ -693,17 +724,24 @@ struct KeyRecorderView: View {
     var body: some View {
         VStack(spacing: 12) {
             Image(systemName: "keyboard").font(.largeTitle)
-            Text(L("Premi il tasto da usare per la dettatura", "Press the key to use for dictation"))
-                .multilineTextAlignment(.center)
+            Text(L("Premi il tasto, il modificatore o il pulsante del mouse da usare",
+                   "Press the key, modifier, or mouse button to use"))
+                .multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
             Text(L("Esc per annullare", "Esc to cancel")).font(.caption).foregroundStyle(.secondary)
         }
-        .padding(24).frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(24)
+        .frame(width: 360)
     }
 }
 
-/// Costruisce un KeyBinding dal primo evento utile (modificatore o tasto normale).
+/// Costruisce un KeyBinding dal primo evento utile (modificatore, tasto o pulsante mouse).
 func keyBinding(from ev: NSEvent) -> KeyBinding? {
     let kc = Int(ev.keyCode)
+    if ev.type == .otherMouseDown {
+        let btn = ev.buttonNumber                 // 2 = centrale, 3 = back, 4 = forward, …
+        return KeyBinding(keyCode: btn, isModifier: false, isMouse: true,
+                          modifierFlags: 0, label: "Mouse \(btn + 1)")
+    }
     if ev.type == .flagsChanged {
         guard let flag = modifierFlag(forKeyCode: kc) else { return nil }
         let m = ev.modifierFlags
