@@ -140,7 +140,7 @@ enum Status: Equatable {
 }
 
 enum ActivationMode: String, CaseIterable, Identifiable {
-    case hold, toggle, both
+    case hold, toggle
     var id: String { rawValue }
 }
 
@@ -471,11 +471,9 @@ final class Coordinator: ObservableObject {
     private var recording = false
     private var timer: Timer?
     private var lastInputMonitoring = false
-    // Stato per la modalità "both" (tap = toggle, hold = push-to-talk).
-    private var pressStart: Date?
-    private var armed = false
-    private var ignoreRelease = false
-    private let tapThreshold: TimeInterval = 0.35
+    // Rilevamento doppio click per la modalità toggle.
+    private var lastPress: Date?
+    private let doubleWindow: TimeInterval = 0.4
 
     init() {
         hotkeys.onPress = { [weak self] in self?.handlePress() }
@@ -491,32 +489,19 @@ final class Coordinator: ObservableObject {
         case .hold:
             startRecording()
         case .toggle:
-            recording ? stopRecording() : startRecording()
-        case .both:
-            if armed {                       // secondo tocco → ferma
-                ignoreRelease = true; armed = false; stopRecording()
-            } else if !recording {
-                pressStart = Date(); startRecording()
+            // Doppio click: due pressioni entro la finestra → start/stop.
+            let now = Date()
+            if let lp = lastPress, now.timeIntervalSince(lp) < doubleWindow {
+                lastPress = nil
+                recording ? stopRecording() : startRecording()
+            } else {
+                lastPress = now
             }
         }
     }
 
     private func handleRelease() {
-        switch state.mode {
-        case .hold:
-            stopRecording()
-        case .toggle:
-            break                            // toggle agisce solo sulla pressione
-        case .both:
-            if ignoreRelease { ignoreRelease = false; return }
-            guard recording, let s = pressStart else { return }
-            pressStart = nil
-            if Date().timeIntervalSince(s) >= tapThreshold {
-                stopRecording()              // è stato un hold
-            } else {
-                armed = true                 // è stato un tap → resta in registrazione
-            }
-        }
+        if state.mode == .hold { stopRecording() }
     }
 
     private func tick() {
@@ -609,10 +594,8 @@ struct MenuView: View {
         switch state.mode {
         case .hold:   return t("Tieni premuto \(k) e parla. Rilascia per incollare.",
                                "Hold \(k) and speak. Release to paste.")
-        case .toggle: return t("Premi \(k) per iniziare, ripremi per fermare e incollare.",
-                               "Press \(k) to start, press again to stop and paste.")
-        case .both:   return t("Tieni premuto per dettare al volo, oppure un tocco per iniziare e un altro per incollare.",
-                               "Hold to dictate on the fly, or tap once to start and again to paste.")
+        case .toggle: return t("Doppio click su \(k) per iniziare, doppio click per fermare e incollare.",
+                               "Double-press \(k) to start, double-press to stop and paste.")
         }
     }
 
@@ -635,20 +618,29 @@ struct MenuView: View {
             }
 
             Divider()
-            Picker(t("Modalità", "Mode"), selection: $state.mode) {
-                Text(t("Tieni premuto", "Hold")).tag(ActivationMode.hold)
-                Text(t("Premi/ripremi", "Toggle")).tag(ActivationMode.toggle)
-                Text(t("Entrambe", "Both")).tag(ActivationMode.both)
-            }
-            HStack {
-                Text(t("Tasto", "Key"))
-                Spacer()
-                Text(state.binding.label).foregroundStyle(.secondary).lineLimit(1)
-                Button(t("Cambia…", "Change…")) { onRecordKey() }.controlSize(.small)
-            }
-            Picker(t("Lingua", "Language"), selection: $state.language) {
-                Text("🇮🇹 Italiano").tag("it-IT")
-                Text("🇬🇧 English").tag("en-US")
+            Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 8, verticalSpacing: 8) {
+                GridRow {
+                    Text(t("Modalità", "Mode"))
+                    Picker("", selection: $state.mode) {
+                        Text(t("Tieni premuto", "Hold")).tag(ActivationMode.hold)
+                        Text(t("Doppio click", "Double-press")).tag(ActivationMode.toggle)
+                    }.labelsHidden()
+                }
+                GridRow {
+                    Text(t("Tasto", "Key"))
+                    HStack(spacing: 6) {
+                        Text(state.binding.label).foregroundStyle(.secondary).lineLimit(1)
+                        Spacer()
+                        Button(t("Cambia…", "Change…")) { onRecordKey() }.controlSize(.small)
+                    }
+                }
+                GridRow {
+                    Text(t("Lingua", "Language"))
+                    Picker("", selection: $state.language) {
+                        Text("🇮🇹 Italiano").tag("it-IT")
+                        Text("🇬🇧 English").tag("en-US")
+                    }.labelsHidden()
+                }
             }
             Toggle(t("Solo riconoscimento on-device", "On-device recognition only"), isOn: $state.onDeviceOnly)
             Toggle(t("Punteggiatura automatica", "Automatic punctuation"), isOn: $state.autoPunctuation)
