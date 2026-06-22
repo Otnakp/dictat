@@ -33,15 +33,21 @@ unzip, and drag `Dictat.app` to `/Applications`.
 
 1. Launch → a `mic` icon appears in the menu bar.
 2. Click it and grant the permissions (see below).
-3. Press your push to talk.
-4. the text is pasted into the active app (Safari, Chrome, Notes, TextEdit, ChatGPT, …).
+3. Two ways to dictate, both always on:
+   - **Hold** the key, speak, release → pastes on release.
+   - **Double-press** the key to start hands-free, **double-press** again to stop and paste.
+4. The text is pasted into the active app (Safari, Chrome, Notes, TextEdit, ChatGPT, …).
+
+Set the key with **Change…** (any modifier or key — modifiers and F13–F20 work best; a
+printable key gets swallowed while it's the hotkey). The language picker (🇮🇹/🇬🇧) switches both
+the recognition and the whole UI; default is English.
 
 ---
 
 
 ## Recognition
 
-- `SFSpeechRecognizer(locale: "it-IT")`, on-device preferred.
+- `SFSpeechRecognizer` for the selected locale (`it-IT` / `en-US`), on-device preferred.
 - If `supportsOnDeviceRecognition` → `requiresOnDeviceRecognition = true` (audio never leaves the device).
 - `addsPunctuation = true`. "On-device only" toggle; clear error if the language model isn't installed.
 

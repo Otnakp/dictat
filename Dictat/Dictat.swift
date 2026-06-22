@@ -139,11 +139,6 @@ enum Status: Equatable {
     }
 }
 
-enum ActivationMode: String, CaseIterable, Identifiable {
-    case hold, toggle
-    var id: String { rawValue }
-}
-
 /// Tasto push-to-talk configurabile: qualsiasi modificatore o tasto normale.
 struct KeyBinding: Codable, Equatable {
     var keyCode: Int
@@ -191,7 +186,7 @@ func keyName(keyCode kc: Int, isModifier: Bool) -> String {
 private enum K {
     static let enabled = "enabled", lang = "language"
     static let onDevice = "onDeviceOnly", punct = "autoPunctuation"
-    static let mode = "activationMode", binding = "keyBinding"
+    static let binding = "keyBinding"
 }
 
 final class AppState: ObservableObject {
@@ -200,7 +195,6 @@ final class AppState: ObservableObject {
     @Published var isRecording = false
     @Published var lastTranscript = ""
     @Published var enabled: Bool         { didSet { d.set(enabled, forKey: K.enabled) } }
-    @Published var mode: ActivationMode  { didSet { d.set(mode.rawValue, forKey: K.mode) } }
     @Published var binding: KeyBinding   { didSet { if let v = try? JSONEncoder().encode(binding) { d.set(v, forKey: K.binding) } } }
     @Published var language: String      { didSet { d.set(language, forKey: K.lang) } }
     @Published var onDeviceOnly: Bool    { didSet { d.set(onDeviceOnly, forKey: K.onDevice) } }
@@ -208,7 +202,6 @@ final class AppState: ObservableObject {
 
     init() {
         enabled = d.object(forKey: K.enabled) as? Bool ?? true
-        mode = ActivationMode(rawValue: d.string(forKey: K.mode) ?? "") ?? .hold
         if let v = d.data(forKey: K.binding), let b = try? JSONDecoder().decode(KeyBinding.self, from: v) {
             binding = b
         } else { binding = .rightOption }
@@ -471,9 +464,15 @@ final class Coordinator: ObservableObject {
     private var recording = false
     private var timer: Timer?
     private var lastInputMonitoring = false
-    // Rilevamento doppio click per la modalità toggle.
-    private var lastPress: Date?
+    // Gesture: hold = push-to-talk; doppio click = hands-free (start), altro doppio click = stop.
+    // Entrambe sempre attive, senza setting di modalità.
+    private let holdThreshold: TimeInterval = 0.3   // oltre = hold; sotto = tap
     private let doubleWindow: TimeInterval = 0.4
+    private var pressDown: Date?
+    private var pendingTapAt: Date?
+    private var handsFree = false
+    private var ignoreRelease = false
+    private var loneTap: DispatchWorkItem?
 
     init() {
         hotkeys.onPress = { [weak self] in self?.handlePress() }
@@ -485,23 +484,38 @@ final class Coordinator: ObservableObject {
     }
 
     private func handlePress() {
-        switch state.mode {
-        case .hold:
-            startRecording()
-        case .toggle:
-            // Doppio click: due pressioni entro la finestra → start/stop.
-            let now = Date()
-            if let lp = lastPress, now.timeIntervalSince(lp) < doubleWindow {
-                lastPress = nil
-                recording ? stopRecording() : startRecording()
-            } else {
-                lastPress = now
-            }
+        let now = Date()
+        // Secondo click di un doppio click?
+        if let tap = pendingTapAt, now.timeIntervalSince(tap) < doubleWindow {
+            pendingTapAt = nil
+            loneTap?.cancel(); loneTap = nil
+            ignoreRelease = true
+            if handsFree { handsFree = false; stopRecording() }  // doppio click → stop
+            else { handsFree = true }                            // doppio click → latch hands-free
+            return
         }
+        pressDown = now
+        if !recording { startRecording() }   // l'audio parte subito (anche per il doppio click)
     }
 
     private func handleRelease() {
-        if state.mode == .hold { stopRecording() }
+        if ignoreRelease { ignoreRelease = false; return }
+        guard let pd = pressDown else { return }
+        let held = Date().timeIntervalSince(pd)
+        pressDown = nil
+        if !handsFree && held >= holdThreshold {
+            stopRecording()                   // è stato un hold (push-to-talk)
+            return
+        }
+        // Tap rapido: può essere il 1° click di un doppio click → attendi la finestra.
+        pendingTapAt = Date()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.pendingTapAt = nil
+            if !self.handsFree { self.stopRecording() }  // tap isolato → ferma (probabilmente vuoto)
+        }
+        loneTap = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + doubleWindow, execute: work)
     }
 
     private func tick() {
@@ -591,12 +605,8 @@ struct MenuView: View {
 
     private var hint: String {
         let k = state.binding.label
-        switch state.mode {
-        case .hold:   return t("Tieni premuto \(k) e parla. Rilascia per incollare.",
-                               "Hold \(k) and speak. Release to paste.")
-        case .toggle: return t("Doppio click su \(k) per iniziare, doppio click per fermare e incollare.",
-                               "Double-press \(k) to start, double-press to stop and paste.")
-        }
+        return t("Tieni premuto \(k) e parla (rilascia per incollare), oppure doppio click per iniziare e doppio click per fermare.",
+                 "Hold \(k) and speak (release to paste), or double-press to start and double-press to stop.")
     }
 
     var body: some View {
@@ -618,28 +628,23 @@ struct MenuView: View {
             }
 
             Divider()
-            Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 8, verticalSpacing: 8) {
-                GridRow {
-                    Text(t("Modalità", "Mode"))
-                    Picker("", selection: $state.mode) {
-                        Text(t("Tieni premuto", "Hold")).tag(ActivationMode.hold)
-                        Text(t("Doppio click", "Double-press")).tag(ActivationMode.toggle)
-                    }.labelsHidden()
-                }
+            Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 10) {
                 GridRow {
                     Text(t("Tasto", "Key"))
-                    HStack(spacing: 6) {
-                        Text(state.binding.label).foregroundStyle(.secondary).lineLimit(1)
-                        Spacer()
+                    HStack(spacing: 8) {
                         Button(t("Cambia…", "Change…")) { onRecordKey() }.controlSize(.small)
-                    }
+                        Spacer()
+                        Text(state.binding.label).foregroundStyle(.secondary).lineLimit(1)
+                    }.frame(maxWidth: .infinity)
                 }
                 GridRow {
                     Text(t("Lingua", "Language"))
                     Picker("", selection: $state.language) {
                         Text("🇮🇹 Italiano").tag("it-IT")
                         Text("🇬🇧 English").tag("en-US")
-                    }.labelsHidden()
+                    }
+                    .labelsHidden()
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
             Toggle(t("Solo riconoscimento on-device", "On-device recognition only"), isOn: $state.onDeviceOnly)
