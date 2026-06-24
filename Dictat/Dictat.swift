@@ -8,6 +8,7 @@ import QuartzCore
 import Carbon.HIToolbox
 import IOKit.hid
 import Sparkle
+import WhisperKit
 
 // MARK: - App shell
 // MenuBarExtra (SwiftUI) non renderizzava l'icona in modo affidabile (sparisce su
@@ -138,7 +139,7 @@ enum Status: Equatable {
         switch self {
         case .idle:         return "mic"
         case .recording:    return "mic.fill"
-        case .transcribing: return "waveform"
+        case .transcribing: return "mic.fill"   // resta un microfono (niente waveform)
         case .error:        return "exclamationmark.triangle.fill"
         }
     }
@@ -198,11 +199,29 @@ func keyName(keyCode kc: Int, isModifier: Bool) -> String {
     return names[kc] ?? "Key \(kc)"
 }
 
+enum Engine: String, CaseIterable, Identifiable { case apple, whisper; var id: String { rawValue } }
+
+enum WhisperState: Equatable { case idle, loading, ready, error(String) }
+
+/// Modelli Whisper offerti (nome esatto del repo WhisperKit su HuggingFace).
+enum WhisperModel: String, CaseIterable, Identifiable {
+    case small  = "openai_whisper-small"
+    case turbo  = "openai_whisper-large-v3-v20240930_turbo_632MB"
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .small: return "Small (~0.5 GB, leggero)"
+        case .turbo: return "Large-v3-turbo (~1.5 GB, accurato)"
+        }
+    }
+}
+
 private enum K {
     static let enabled = "enabled", lang = "language"
     static let onDevice = "onDeviceOnly", punct = "autoPunctuation"
     static let bindings = "keyBindings"
     static let historyOn = "historyEnabled", history = "history"
+    static let engine = "engine", whisperModel = "whisperModel", whisperStreaming = "whisperStreaming"
 }
 
 final class AppState: ObservableObject {
@@ -218,6 +237,9 @@ final class AppState: ObservableObject {
     @Published var autoPunctuation: Bool { didSet { d.set(autoPunctuation, forKey: K.punct) } }
     @Published var historyEnabled: Bool  { didSet { d.set(historyEnabled, forKey: K.historyOn) } }
     @Published var history: [String]     { didSet { d.set(history, forKey: K.history) } }
+    @Published var engine: Engine        { didSet { d.set(engine.rawValue, forKey: K.engine) } }
+    @Published var whisperModel: WhisperModel { didSet { d.set(whisperModel.rawValue, forKey: K.whisperModel) } }
+    @Published var whisperStreaming: Bool { didSet { d.set(whisperStreaming, forKey: K.whisperStreaming) } }
 
     static let maxHistory = 10
 
@@ -231,6 +253,9 @@ final class AppState: ObservableObject {
         autoPunctuation = d.object(forKey: K.punct) as? Bool ?? true
         historyEnabled = d.object(forKey: K.historyOn) as? Bool ?? false   // OFF di default
         history = d.stringArray(forKey: K.history) ?? []
+        engine = Engine(rawValue: d.string(forKey: K.engine) ?? "") ?? .apple   // Apple di default
+        whisperModel = WhisperModel(rawValue: d.string(forKey: K.whisperModel) ?? "") ?? .small
+        whisperStreaming = d.object(forKey: K.whisperStreaming) as? Bool ?? true   // ON di default
     }
 
     func addHistory(_ s: String) {
@@ -384,7 +409,9 @@ final class HotkeyManager {
                     let flag = CGEventFlags(rawValue: b.modifierFlags)
                     guard flag.contains(.maskSecondaryFn) || kc == b.keyCode else { continue }
                     if flags.contains(flag) { downSet.insert(sig) } else { downSet.remove(sig) }
-                    // i modificatori non si consumano
+                    // Fn/Globe: lo consumiamo, così macOS non esegue la sua azione (emoji/
+                    // dettatura/affianca finestre). Gli altri modificatori restano passanti.
+                    if flag.contains(.maskSecondaryFn) { consume = true }
                 } else {
                     guard (type == .keyDown || type == .keyUp), kc == b.keyCode else { continue }
                     let need = CGEventFlags(rawValue: b.modifierFlags).intersection(modMask)
@@ -408,6 +435,22 @@ final class HotkeyManager {
 
 // MARK: - Speech
 
+/// Interfaccia comune ai motori di trascrizione (Apple / Whisper): ricevono audio via
+/// `append` e notificano coda live (`onTail`), consolidamento (`onCommit`), fine e errore.
+protocol Transcriber: AnyObject {
+    var onTail: ((String) -> Void)? { get set }
+    var onCommit: (() -> Void)? { get set }
+    var onText: ((String) -> Void)? { get set }   // testo COMPLETO (streaming Whisper)
+    var onDone: (() -> Void)? { get set }
+    var onError: ((String) -> Void)? { get set }
+    var ownsAudio: Bool { get }                    // true se cattura il microfono da sé
+    func start() throws
+    func append(_ buffer: AVAudioPCMBuffer)
+    func stopAndFinalize()
+    func cancel()
+}
+extension Transcriber { var ownsAudio: Bool { false } }   // default: usa il nostro AVAudioEngine
+
 /// Trascrizione LIVE parola per parola con UN SOLO task continuo.
 /// SFSpeech dopo una pausa segna la fine dell'utterance con `speechRecognitionMetadata != nil`
 /// e fa RIPARTIRE `formattedString` da zero (solo la nuova frase). Quindi: a ogni risultato
@@ -415,9 +458,10 @@ final class HotkeyManager {
 /// la metadata consolidiamo (onCommit) — il testo consolidato non viene MAI più toccato, e la
 /// nuova utterance riparte pulita. Niente restart sul silenzio (era la fonte delle race/perdite):
 /// si riavvia il task SOLO al limite di sessione (~1 min) o su errore, con generation guard.
-final class SpeechTranscriber {
+final class SpeechTranscriber: Transcriber {
     var onTail: ((String) -> Void)?     // coda dell'utterance corrente (può cambiare)
     var onCommit: (() -> Void)?         // utterance finita → consolida e separa
+    var onText: ((String) -> Void)?     // non usato (Apple usa onTail/onCommit)
     var onDone: (() -> Void)?           // riconoscimento concluso (dopo il rilascio)
     var onError: ((String) -> Void)?
 
@@ -521,6 +565,171 @@ final class SpeechTranscriber {
         userInfo: [NSLocalizedDescriptionKey: m]) }
 }
 
+// MARK: - Whisper (WhisperKit, on-device)
+
+/// Tiene UNA istanza WhisperKit caricata (una volta sola). Da fermo non consuma: l'inferenza
+/// gira solo durante la trascrizione. Ricarica solo se cambi modello.
+actor WhisperLoader {
+    static let shared = WhisperLoader()
+    private var kit: WhisperKit?
+    private var loaded: String?
+
+    func instance(model: String) async throws -> WhisperKit {
+        if let kit, loaded == model { return kit }
+        // load: true → carica TUTTO (incl. tokenizer). prewarm: true → compila i modelli per
+        // il Neural Engine in anticipo, così la prima trascrizione non lagga (cold start).
+        let k = try await WhisperKit(WhisperKitConfig(model: model, prewarm: true, load: true))
+        kit = k; loaded = model
+        return k
+    }
+}
+
+/// Motore Whisper: riusa l'audio del nostro AVAudioEngine (niente conflitto microfono),
+/// accumula i campioni a 16 kHz mono e trascrive UNA volta al rilascio (battery-friendly).
+/// Non è live: il testo compare alla fine.
+final class WhisperTranscriber: Transcriber {
+    var onTail: ((String) -> Void)?
+    var onCommit: (() -> Void)?
+    var onText: ((String) -> Void)?   // non usato (batch usa onTail/onCommit)
+    var onDone: (() -> Void)?
+    var onError: ((String) -> Void)?
+
+    private let model: String
+    private let language: String
+    private let lock = NSLock()
+    private var samples: [Float] = []
+    private var converter: AVAudioConverter?
+    private let target = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
+    private var done = false
+
+    init(model: String, language: String) {
+        self.model = model
+        self.language = language
+    }
+
+    func start() throws {
+        lock.lock(); samples.removeAll(); lock.unlock()
+        let model = self.model
+        Task { _ = try? await WhisperLoader.shared.instance(model: model) }   // precarica mentre parli
+    }
+
+    func append(_ buffer: AVAudioPCMBuffer) {
+        if converter == nil { converter = AVAudioConverter(from: buffer.format, to: target) }
+        guard let conv = converter else { return }
+        let ratio = target.sampleRate / buffer.format.sampleRate
+        let cap = AVAudioFrameCount(Double(buffer.frameLength) * ratio + 1024)
+        guard let out = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: cap) else { return }
+        var fed = false
+        var err: NSError?
+        conv.convert(to: out, error: &err) { _, status in
+            if fed { status.pointee = .noDataNow; return nil }
+            fed = true; status.pointee = .haveData; return buffer
+        }
+        guard err == nil, let ch = out.floatChannelData, out.frameLength > 0 else { return }
+        let n = Int(out.frameLength)
+        lock.lock(); samples.append(contentsOf: UnsafeBufferPointer(start: ch[0], count: n)); lock.unlock()
+    }
+
+    func stopAndFinalize() {
+        lock.lock(); let audio = samples; lock.unlock()
+        guard !audio.isEmpty else { finish(); return }
+        let model = self.model, language = self.language
+        Task {
+            do {
+                let kit = try await WhisperLoader.shared.instance(model: model)
+                var opts = DecodingOptions()
+                opts.language = language
+                opts.skipSpecialTokens = true
+                opts.withoutTimestamps = true
+                opts.chunkingStrategy = .vad          // gestisce audio > 30s
+                let results = try await kit.transcribe(audioArray: audio, decodeOptions: opts)
+                let text = results.map { $0.text }.joined(separator: " ")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                await MainActor.run {
+                    guard !self.done else { return }
+                    if !text.isEmpty { self.onTail?(text); self.onCommit?() }
+                    self.done = true; self.onDone?()
+                }
+            } catch {
+                await MainActor.run {
+                    guard !self.done else { return }
+                    self.done = true; self.onError?(error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    func cancel() { done = true; lock.lock(); samples.removeAll(); lock.unlock() }
+
+    private func finish() { guard !done else { return }; done = true; onDone?() }
+}
+
+/// Streaming Whisper: WhisperKit cattura il microfono e trascrive in tempo reale, esponendo
+/// testo confermato (stabile) + ipotesi (live). Emettiamo il testo COMPLETO via onText: il
+/// prefisso confermato è stabile, quindi il diff del Coordinator non cancella il pregresso.
+/// Un po' più pesante (inferenza continua).
+final class WhisperStreamTranscriber: Transcriber {
+    var onTail: ((String) -> Void)?
+    var onCommit: (() -> Void)?
+    var onText: ((String) -> Void)?
+    var onDone: (() -> Void)?
+    var onError: ((String) -> Void)?
+    var ownsAudio: Bool { true }   // il microfono lo gestisce WhisperKit
+
+    private let model: String
+    private let language: String
+    private var streamer: AudioStreamTranscriber?
+    private var done = false
+
+    init(model: String, language: String) { self.model = model; self.language = language }
+
+    func start() throws {
+        let model = self.model, language = self.language
+        Task {
+            do {
+                let kit = try await WhisperLoader.shared.instance(model: model)
+                guard let tokenizer = kit.tokenizer else {
+                    await MainActor.run { self.onError?("Whisper: tokenizer non disponibile") }; return
+                }
+                var opts = DecodingOptions()
+                opts.language = language
+                opts.skipSpecialTokens = true      // niente <|startoftranscript|> ecc.
+                opts.withoutTimestamps = true       // niente <|0.00|> nel testo
+                let st = AudioStreamTranscriber(
+                    audioEncoder: kit.audioEncoder,
+                    featureExtractor: kit.featureExtractor,
+                    segmentSeeker: kit.segmentSeeker,
+                    textDecoder: kit.textDecoder,
+                    tokenizer: tokenizer,
+                    audioProcessor: kit.audioProcessor,
+                    decodingOptions: opts,
+                    stateChangeCallback: { [weak self] _, newState in
+                        let confirmed = newState.confirmedSegments.map { $0.text }.joined()
+                        let hyp = newState.unconfirmedSegments.map { $0.text }.joined()
+                        let full = (confirmed + hyp).trimmingCharacters(in: .whitespacesAndNewlines)
+                        Task { @MainActor in self?.onText?(full) }
+                    })
+                self.streamer = st
+                try await st.startStreamTranscription()
+            } catch {
+                await MainActor.run { self.onError?(error.localizedDescription) }
+            }
+        }
+    }
+
+    func append(_ buffer: AVAudioPCMBuffer) {}   // microfono gestito da WhisperKit
+
+    func stopAndFinalize() {
+        let st = streamer
+        Task {
+            await st?.stopStreamTranscription()
+            await MainActor.run { guard !self.done else { return }; self.done = true; self.onDone?() }
+        }
+    }
+
+    func cancel() { done = true; let st = streamer; Task { await st?.stopStreamTranscription() } }
+}
+
 // MARK: - Paste
 
 final class PasteManager {
@@ -576,12 +785,15 @@ final class Coordinator: ObservableObject {
     private let engine = AVAudioEngine()
     private let paster = PasteManager()
     private let hotkeys = HotkeyManager()
-    private var transcriber: SpeechTranscriber?
+    private var transcriber: (any Transcriber)?
     private var recording = false
     private var timer: Timer?
     private var lastInputMonitoring = false
     private var tail = ""           // coda del segmento corrente già digitata (diff live)
     private var committedText = ""  // testo consolidato di questa sessione (mai cancellato)
+    private var streamVisible = ""  // testo già digitato in streaming Whisper (diff full-text)
+    @Published var whisperState: WhisperState = .idle
+    private var bag = Set<AnyCancellable>()
     // Gesture: hold = push-to-talk; doppio click = hands-free (start), altro doppio click = stop.
     // Entrambe sempre attive, senza setting di modalità.
     private let holdThreshold: TimeInterval = 0.3   // oltre = hold; sotto = tap
@@ -599,6 +811,29 @@ final class Coordinator: ObservableObject {
         hotkeys.enabledProvider = { [weak self] in self?.state.enabled ?? false }
         tick()
         timer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in self?.tick() }
+        // Prepara il modello Whisper AUTOMATICAMENTE quando il motore è Whisper (anche al
+        // lancio) e quando cambi modello → nessun bottone da premere.
+        state.$engine.sink { [weak self] eng in if eng == .whisper { self?.prepareWhisper() } }.store(in: &bag)
+        state.$whisperModel.dropFirst().sink { [weak self] _ in
+            guard let self else { return }
+            self.whisperState = .idle
+            if self.state.engine == .whisper { self.prepareWhisper() }
+        }.store(in: &bag)
+    }
+
+    /// Carica (e prewarm) il modello Whisper in background. Idempotente.
+    func prepareWhisper() {
+        guard whisperState != .loading, whisperState != .ready else { return }
+        whisperState = .loading
+        let model = state.whisperModel.rawValue
+        Task {
+            do {
+                _ = try await WhisperLoader.shared.instance(model: model)
+                await MainActor.run { self.whisperState = .ready }
+            } catch {
+                await MainActor.run { self.whisperState = .error(error.localizedDescription) }
+            }
+        }
     }
 
     private func handlePress() {
@@ -653,17 +888,33 @@ final class Coordinator: ObservableObject {
         guard state.enabled, !recording else { return }
         perm.refresh()
         guard perm.mic else { state.status = .error(L("Microfono non autorizzato", "Microphone not authorized")); perm.requestMic(); return }
-        guard perm.speech else { state.status = .error(L("Speech non autorizzato", "Speech not authorized")); perm.requestSpeech(); return }
+        if state.engine == .apple {   // Whisper non usa Apple Speech
+            guard perm.speech else { state.status = .error(L("Speech non autorizzato", "Speech not authorized")); perm.requestSpeech(); return }
+        }
 
-        state.lastTranscript = ""; tail = ""; committedText = ""
-        let t = SpeechTranscriber(locale: Locale(identifier: state.language),
+        state.lastTranscript = ""; tail = ""; committedText = ""; streamVisible = ""
+        let short = String(state.language.prefix(2))   // "it"/"en"
+        let t: any Transcriber
+        if state.engine == .whisper && state.whisperStreaming {
+            t = WhisperStreamTranscriber(model: state.whisperModel.rawValue, language: short)
+        } else if state.engine == .whisper {
+            t = WhisperTranscriber(model: state.whisperModel.rawValue, language: short)
+        } else {
+            t = SpeechTranscriber(locale: Locale(identifier: state.language),
                                   onDeviceOnly: state.onDeviceOnly, punct: state.autoPunctuation)
-        t.onTail = { [weak self] s in self?.renderTail(s) }      // scrittura live (solo la coda)
-        t.onCommit = { [weak self] in self?.commitTail() }       // consolida: non più toccato
+        }
+        t.onTail = { [weak self] s in self?.renderTail(s) }      // Apple/batch: solo la coda
+        t.onCommit = { [weak self] in self?.commitTail() }
+        t.onText = { [weak self] s in self?.renderFull(s) }      // streaming Whisper: testo completo
         t.onDone = { [weak self] in
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.state.addHistory(self.committedText)
+                // streaming Whisper: separa il prossimo dettato con uno spazio
+                if self.state.engine == .whisper && self.state.whisperStreaming
+                    && self.perm.accessibility && !self.streamVisible.isEmpty {
+                    self.paster.type(" ")
+                }
+                self.state.addHistory(self.state.lastTranscript)
                 self.transcriber = nil; self.state.status = .idle
             }
         }
@@ -672,12 +923,14 @@ final class Coordinator: ObservableObject {
         }
         do {
             try t.start()
-            let input = engine.inputNode
-            let fmt = input.outputFormat(forBus: 0)
-            input.removeTap(onBus: 0)
-            input.installTap(onBus: 0, bufferSize: 1024, format: fmt) { buf, _ in t.append(buf) }
-            engine.prepare()
-            try engine.start()
+            if !t.ownsAudio {                       // Whisper streaming gestisce il microfono da sé
+                let input = engine.inputNode
+                let fmt = input.outputFormat(forBus: 0)
+                input.removeTap(onBus: 0)
+                input.installTap(onBus: 0, bufferSize: 1024, format: fmt) { buf, _ in t.append(buf) }
+                engine.prepare()
+                try engine.start()
+            }
             transcriber = t
             recording = true; state.isRecording = true; state.status = .recording
             NSSound(named: "Tink")?.play()
@@ -719,6 +972,25 @@ final class Coordinator: ObservableObject {
         state.lastTranscript = committedText + tail
     }
 
+    /// Streaming Whisper: diff sul testo COMPLETO (confermato+ipotesi). Il prefisso confermato
+    /// è stabile, quindi il prefisso comune copre il consolidato e il backspace tocca solo la coda.
+    private func renderFull(_ target: String) {
+        guard perm.accessibility else {
+            state.status = .error(L("Abilita Accessibilità per scrivere", "Enable Accessibility to type"))
+            return
+        }
+        let v = Array(streamVisible), t = Array(target)
+        var common = 0
+        let n = min(v.count, t.count)
+        while common < n && v[common] == t[common] { common += 1 }
+        let deletes = v.count - common
+        if deletes > 0 { paster.backspace(deletes) }
+        let suffix = String(t[common...])
+        if !suffix.isEmpty { paster.type(suffix) }
+        streamVisible = target
+        state.lastTranscript = target
+    }
+
     /// La coda è definitiva: aggiungi un separatore e "consolidala" (non più diffata).
     private func commitTail() {
         guard perm.accessibility else { return }
@@ -751,6 +1023,25 @@ struct MenuView: View {
     private func t(_ it: String, _ en: String) -> String { state.language.hasPrefix("it") ? it : en }
     private func copy(_ s: String) { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(s, forType: .string) }
 
+    @ViewBuilder private var whisperStatusRow: some View {
+        switch coord.whisperState {
+        case .idle, .loading:
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.small)
+                Text(t("Preparazione modello…", "Preparing model…")).font(.caption)
+            }
+        case .ready:
+            Label(t("Modello pronto", "Model ready"), systemImage: "checkmark.circle.fill")
+                .foregroundStyle(.green).font(.caption)
+        case .error(let m):
+            VStack(alignment: .leading, spacing: 2) {
+                Text(t("Errore modello", "Model error")).font(.caption).foregroundStyle(.red)
+                Text(m).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
+                Button(t("Riprova", "Retry")) { coord.prepareWhisper() }.controlSize(.small)
+            }
+        }
+    }
+
     private var hint: String {
         t("Tieni premuto un trigger e parla (rilascia per incollare), oppure doppio click per iniziare e doppio click per fermare.",
           "Hold a trigger and speak (release to paste), or double-press to start and double-press to stop.")
@@ -769,7 +1060,9 @@ struct MenuView: View {
                 Divider()
                 Text(t("Permessi mancanti", "Missing permissions")).font(.caption).bold().foregroundStyle(.orange)
                 permRow(t("Microfono", "Microphone"), perm.mic) { perm.requestMic() }
-                permRow(t("Riconoscimento vocale", "Speech Recognition"), perm.speech) { perm.requestSpeech() }
+                if state.engine == .apple {
+                    permRow(t("Riconoscimento vocale", "Speech Recognition"), perm.speech) { perm.requestSpeech() }
+                }
                 permRow(t("Accessibilità (per incollare)", "Accessibility (paste)"), perm.accessibility) { perm.requestAccessibility() }
                 permRow(t("Input Monitoring (hotkey globale)", "Input Monitoring (global hotkey)"), perm.inputMonitoring) { perm.requestInputMonitoring() }
             }
@@ -802,7 +1095,27 @@ struct MenuView: View {
                 }.labelsHidden().fixedSize()
                 Spacer()
             }
-            Toggle(t("Solo riconoscimento on-device", "On-device recognition only"), isOn: $state.onDeviceOnly)
+            HStack {
+                Text(t("Motore", "Engine"))
+                Picker("", selection: $state.engine) {
+                    Text("Apple").tag(Engine.apple)
+                    Text("Whisper").tag(Engine.whisper)
+                }.labelsHidden().fixedSize()
+                Spacer()
+            }
+            if state.engine == .whisper {
+                Picker(t("Modello Whisper", "Whisper model"), selection: $state.whisperModel) {
+                    ForEach(WhisperModel.allCases) { Text($0.label).tag($0) }
+                }.controlSize(.small)
+                whisperStatusRow
+                Toggle(t("Streaming live", "Live streaming"), isOn: $state.whisperStreaming)
+                Text(t("? Streaming: scrive mentre parli, un po' più pesante (inferenza continua). Spento: scrive al rilascio. Whisper capisce meglio i termini tecnici/anglicismi.",
+                       "? Streaming: types while you speak, a bit heavier (continuous inference). Off: types on release. Whisper handles technical terms better."))
+                    .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            if state.engine == .apple {
+                Toggle(t("Solo riconoscimento on-device", "On-device recognition only"), isOn: $state.onDeviceOnly)
+            }
             Toggle(t("Punteggiatura automatica", "Automatic punctuation"), isOn: $state.autoPunctuation)
             Toggle(t("Aggiornamenti automatici", "Automatic updates"),
                    isOn: Binding(get: autoUpdateGet, set: autoUpdateSet))
@@ -847,7 +1160,9 @@ struct MenuView: View {
         .frame(width: 320)
     }
 
-    private var allPerms: Bool { perm.mic && perm.speech && perm.accessibility && perm.inputMonitoring }
+    private var allPerms: Bool {
+        perm.mic && perm.accessibility && perm.inputMonitoring && (state.engine == .whisper || perm.speech)
+    }
 
     @ViewBuilder
     private func permRow(_ name: String, _ ok: Bool, _ action: @escaping () -> Void) -> some View {

@@ -10,7 +10,9 @@ Native macOS **push-to-talk dictation** in the menu bar. Like Wispr Flow, but **
 Hold a key, speak, release: the transcription (Apple Speech, on-device) is pasted into whatever text
 field is focused automatically.
 
-No cloud, account, OpenAI/Whisper, Electron/Python. Only public Apple APIs that already works perfectly on your computer. Auto updates, and cool permission flow with
+No cloud, no accounts, no paid APIs, no Electron/Python. Apple's on-device Speech by default —
+or an optional **local Whisper** engine (via WhisperKit, runs on the Neural Engine) for tougher
+vocabulary. Either way the audio never leaves your Mac. Auto-updates and a slick permission flow with
 [Sparkle](https://sparkle-project.org) and
 [Permiso](https://github.com/zats/permiso).
 
@@ -51,18 +53,29 @@ unzip, and drag `Dictat.app` to `/Applications`.
    - **Double-press** the key to start hands-free, **double-press** again to stop and paste.
 4. The text is pasted into the active app (Safari, Chrome, Notes, TextEdit, ChatGPT, …).
 
-Set the key with **Change…** (any modifier or key — modifiers and F13–F20 work best; a
-printable key gets swallowed while it's the hotkey). The language picker (🇮🇹/🇬🇧) switches both
-the recognition and the whole UI; default is English.
+Language picker (🇮🇹/🇬🇧) switches both the recognition and the whole UI; default is English.
 
 ---
 
+## Engines
 
-## Recognition
+Pick the engine in the menu:
 
-- `SFSpeechRecognizer` for the selected locale (`it-IT` / `en-US`), on-device preferred.
-- If `supportsOnDeviceRecognition` → `requiresOnDeviceRecognition = true` (audio never leaves the device).
-- `addsPunctuation = true`. "On-device only" toggle; clear error if the language model isn't installed.
+- **Apple** (default) — Apple's on-device `SFSpeechRecognizer`. Real, lightweight **live streaming**:
+  words appear as you speak. Best for battery. On-device preferred (`requiresOnDeviceRecognition`),
+  automatic punctuation.
+- **Whisper** (local, via [WhisperKit](https://github.com/argmaxinc/WhisperKit)) — runs OpenAI's Whisper
+  on the Neural Engine, fully on-device. Much better at technical terms, code, filenames and anglicisms
+  (e.g. *promptare*, *notes.md*). Choose a model (**Small** ~0.5 GB / **Large-v3-turbo** ~1.5 GB); it
+  auto-downloads and prewarms on first use, then stays resident (idle = no battery use). **Streaming**
+  toggle: on = types live (heavier, continuous inference); off = transcribes once on release (lighter).
+
+## Settings
+
+- **Triggers** — bind up to **5** keys/modifiers, or even **mouse buttons** (side/middle); any one
+  activates dictation. Recorded by pressing the key (some mice with custom drivers may not expose buttons).
+- **History** — optional (off by default), keeps the last 10 transcriptions to copy from the menu.
+- **Auto-updates** — Sparkle checks/installs new versions; toggle in the menu.
 
 ---
 
@@ -75,7 +88,7 @@ open Dictat.xcodeproj      # scheme "Dictat", then Cmd+R
 ```
 
 Debug builds are ad-hoc signed; sandbox is **off** (required for the global CGEvent tap and `Cmd+V`).
-Sparkle is pulled automatically as a Swift Package dependency.
+Sparkle and WhisperKit are pulled automatically as Swift Package dependencies.
 
 
 ## Troubleshooting

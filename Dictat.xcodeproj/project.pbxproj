@@ -8,6 +8,7 @@
 /* Begin PBXBuildFile section */
 		AA0000000000000000000201 /* Dictat.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000101 /* Dictat.swift */; };
 		AA0000000000000000000301 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = AA0000000000000000000401 /* Sparkle */; };
+		AA0000000000000000000302 /* WhisperKit in Frameworks */ = {isa = PBXBuildFile; productRef = AA0000000000000000000402 /* WhisperKit */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -23,6 +24,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				AA0000000000000000000301 /* Sparkle in Frameworks */,
+				AA0000000000000000000302 /* WhisperKit in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -81,6 +83,7 @@
 			name = Dictat;
 			packageProductDependencies = (
 				AA0000000000000000000401 /* Sparkle */,
+				AA0000000000000000000402 /* WhisperKit */,
 			);
 			productName = Dictat;
 			productReference = AA0000000000000000000007 /* Dictat.app */;
@@ -107,6 +110,7 @@
 			mainGroup = AA0000000000000000000002 /* main group */;
 			packageReferences = (
 				AA0000000000000000000501 /* XCRemoteSwiftPackageReference "Sparkle" */,
+				AA0000000000000000000502 /* XCRemoteSwiftPackageReference "argmax-oss-swift" */,
 			);
 			productRefGroup = AA0000000000000000000005 /* Products */;
 			projectDirPath = "";
@@ -252,6 +256,14 @@
 				minimumVersion = 2.6.0;
 			};
 		};
+		AA0000000000000000000502 /* XCRemoteSwiftPackageReference "argmax-oss-swift" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/argmaxinc/argmax-oss-swift";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 0.9.0;
+			};
+		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -259,6 +271,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = AA0000000000000000000501 /* XCRemoteSwiftPackageReference "Sparkle" */;
 			productName = Sparkle;
+		};
+		AA0000000000000000000402 /* WhisperKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = AA0000000000000000000502 /* XCRemoteSwiftPackageReference "argmax-oss-swift" */;
+			productName = WhisperKit;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};
