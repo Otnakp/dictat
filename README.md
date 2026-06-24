@@ -26,16 +26,12 @@ Lives only in the menu bar. All code in one file:
 ### Homebrew (recommended)
 
 ```bash
-brew tap otnakp/dictat            # adds the otnakp/homebrew-dictat tap
+brew tap otnakp/dictat 
 brew install --cask dictat
 ```
 
 Once you install, notice the small microphone icon on the top bar. That's Dictat.
 
-```bash
-brew trust otnakp/dictat
-brew install --cask dictat
-```
 
 ### Manual
 
